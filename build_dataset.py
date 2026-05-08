@@ -22,10 +22,13 @@ def main() -> None:
 
     split_result = split_slide_pairs(
         pairs=pairs,
-        split_counts=config.SPLIT_COUNTS,
-        random_seed=config.RANDOM_SEED,
+        split_ratios=config.SPLIT_RATIOS,
+        split_min_slides=config.SPLIT_MIN_SLIDES,
+        ann_weight=config.SPLIT_ANN_WEIGHT,
+        slide_weight=config.SPLIT_SLIDE_WEIGHT,
         manual_split=config.MANUAL_SPLIT,
     )
+
     print_split_result(split_result)
 
     tasks = _build_tasks(split_result)
