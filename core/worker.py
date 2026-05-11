@@ -62,7 +62,7 @@ def process_one_slide(
     3. 解析 GeoJSON；
     4. 建立 CUDA bbox tensor；
     5. 生成正样本；
-    6. 按正样本数量生成 2 倍负样本。
+     6. 按 config.NEG_POS_RATIO 生成负样本。
     """
     device = get_cuda_device(
         device_name=config.CUDA_DEVICE,

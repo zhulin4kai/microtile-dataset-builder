@@ -96,8 +96,11 @@ def _check_config() -> None:
     if config.LEVEL != 0:
         raise ValueError("当前工程方案固定使用 level 0。")
 
-    if config.POS_PATCHES_PER_ANNOTATION <= 0:
-        raise ValueError("POS_PATCHES_PER_ANNOTATION must be positive.")
+    if config.POS_TARGET_COVERAGE <= 0:
+        raise ValueError("POS_TARGET_COVERAGE must be positive.")
+
+    if config.POS_MAX_TRIES_PER_ANN <= 0:
+        raise ValueError("POS_MAX_TRIES_PER_ANN must be positive.")
 
     if config.NEG_POS_RATIO < 0:
         raise ValueError("NEG_POS_RATIO must be >= 0.")
@@ -119,7 +122,7 @@ def _build_tasks(split_result: SplitResult) -> List[Tuple[str, SlidePair]]:
 
     split_dict = split_result.as_dict()
 
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         for pair in split_dict[split_name]:
             tasks.append((split_name, pair))
 
@@ -140,7 +143,6 @@ def _print_summary(
     split_summary: Dict[str, Dict[str, int]] = {
         "train": {"pos": 0, "neg": 0},
         "val": {"pos": 0, "neg": 0},
-        "test": {"pos": 0, "neg": 0},
     }
 
     for stats in sorted(stats_list, key=lambda s: (s.split_name, s.slide_stem)):
@@ -166,7 +168,7 @@ def _print_summary(
         )
 
     print("\n[Split]")
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         item = split_summary[split_name]
         print(f"  {split_name}: pos={item['pos']}, neg={item['neg']}")
 

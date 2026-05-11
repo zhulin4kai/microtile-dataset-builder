@@ -5,17 +5,19 @@ YOLO 数据集抽查脚本。
     python tools/check_yolo_dataset.py
 
 功能：
-1. 从 images/train、images/val、images/test 随机抽正样本；
+1. 从 images/train、images/val 随机抽正样本；
 2. 从空 label 中随机抽负样本；
 3. 正样本画 YOLO bbox；
-4. 输出到 CHECK_OUTPUT_DIR，方便人工查看。
+4. 统计 train 中各 variant 数量（颜色增强检查）；
+5. 输出到 CHECK_OUTPUT_DIR，方便人工查看。
 """
 
 from __future__ import annotations
 
 import random
+from collections import Counter
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -48,7 +50,7 @@ BOX_WIDTH = 3
 def main() -> None:
     rng = random.Random(RANDOM_SEED)
 
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         print(f"[INFO] checking split: {split_name}")
 
         image_dir = DATASET_DIR / "images" / split_name
@@ -75,8 +77,16 @@ def main() -> None:
                 neg_pairs.append((image_path, label_path))
 
         print(
-            f"  total={len(pairs)}, " f"pos={len(pos_pairs)}, " f"neg={len(neg_pairs)}"
+            f"  total={len(pairs)}, "
+            f"pos={len(pos_pairs)}, "
+            f"neg={len(neg_pairs)}"
         )
+
+        # 统计 variant 数量
+        variant_counts = _count_variants(image_dir)
+        if variant_counts:
+            vc_str = " ".join(f"{k}={v}" for k, v in sorted(variant_counts.items()))
+            print(f"  variants: {vc_str}")
 
         sampled_pos = sample_pairs(pos_pairs, SAMPLES_PER_SPLIT_POS, rng)
         sampled_neg = sample_pairs(neg_pairs, SAMPLES_PER_SPLIT_NEG, rng)
@@ -96,12 +106,37 @@ def main() -> None:
     print(f"[DONE] check results saved to: {CHECK_OUTPUT_DIR}")
 
 
+def _count_variants(image_dir: Path) -> Dict[str, int]:
+    """统计目录中各 variant 的文件数量。"""
+    variant_counter: Counter[str] = Counter()
+
+    for p in image_dir.iterdir():
+        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
+            continue
+
+        stem = p.stem
+        # 期望格式: slide_pos_000001_x123_y456_variant
+        parts = stem.rsplit("_", 1)
+        if len(parts) == 2 and parts[1] in {
+            "orig",
+            "clahe",
+            "hsv",
+            "brightness_contrast",
+            "gamma",
+        }:
+            variant_counter[parts[1]] += 1
+
+    return dict(variant_counter)
+
+
 def collect_image_label_pairs(
     image_dir: Path,
     label_dir: Path,
 ) -> List[Tuple[Path, Path]]:
     image_paths = [
-        p for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS
+        p
+        for p in image_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS
     ]
 
     pairs: List[Tuple[Path, Path]] = []
@@ -152,7 +187,9 @@ def save_checked_samples(
         checked.save(out_path, quality=95)
 
 
-def read_yolo_label(label_path: Path) -> List[Tuple[int, float, float, float, float]]:
+def read_yolo_label(
+    label_path: Path,
+) -> List[Tuple[int, float, float, float, float]]:
     text = label_path.read_text(encoding="utf-8").strip()
 
     if not text:

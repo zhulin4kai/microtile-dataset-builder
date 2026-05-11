@@ -4,13 +4,14 @@ YOLO 数据写入模块。
 
 职责：
 1. 创建 images/train、labels/train 等目录；
-2. 保存 jpg tile；
+2. 保存 jpg tile（支持多颜色增强版本）；
 3. 保存 YOLO txt；
 4. 保证 image 与 label 文件名一一对应。
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -18,6 +19,7 @@ from typing import List, Sequence, Tuple
 from PIL import Image
 
 import config
+from core.color_augment import make_color_augmented_images
 
 YoloBox = Tuple[float, float, float, float]
 
@@ -27,6 +29,7 @@ class WrittenSample:
     image_path: Path
     label_path: Path
     filename_stem: str
+    variant: str
 
 
 def prepare_output_dirs(output_dir: Path) -> None:
@@ -37,15 +40,13 @@ def prepare_output_dirs(output_dir: Path) -> None:
       images/
         train/
         val/
-        test/
       labels/
         train/
         val/
-        test/
     """
     output_dir = Path(output_dir)
 
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         (output_dir / "images" / split_name).mkdir(parents=True, exist_ok=True)
         (output_dir / "labels" / split_name).mkdir(parents=True, exist_ok=True)
 
@@ -56,11 +57,12 @@ def build_sample_stem(
     sample_index: int,
     x0: int,
     y0: int,
+    variant: str = "orig",
 ) -> str:
     """
-    文件名带来源坐标，方便回查。
+    文件名带来源坐标和 variant，方便回查。
     """
-    return f"{slide_stem}_{sample_type}_{sample_index:06d}_x{x0}_y{y0}"
+    return f"{slide_stem}_{sample_type}_{sample_index:06d}_x{x0}_y{y0}_{variant}"
 
 
 def write_yolo_sample(
@@ -74,40 +76,60 @@ def write_yolo_sample(
     image: Image.Image,
     yolo_boxes: Sequence[YoloBox],
     class_id: int,
-) -> WrittenSample:
+    rng: random.Random,
+) -> List[WrittenSample]:
     """
-    保存一个 YOLO 样本。
+    保存一个 YOLO 样本（支持颜色增强多版本）。
 
     正样本：
         yolo_boxes 非空
 
     负样本：
         yolo_boxes 为空，写空 txt
+
+    train 且 ENABLE_COLOR_AUGMENT=True：
+        保存 orig + 4 种颜色增强版本（每个版本保存独立 image 和 label）
+
+    val：
+        只保存 orig
     """
     output_dir = Path(output_dir)
 
-    if split_name not in ("train", "val", "test"):
+    if split_name not in ("train", "val"):
         raise ValueError(f"Invalid split_name: {split_name}")
 
-    sample_stem = build_sample_stem(
-        slide_stem=slide_stem,
-        sample_type=sample_type,
-        sample_index=sample_index,
-        x0=x0,
-        y0=y0,
-    )
+    augmented = make_color_augmented_images(image, rng, split_name)
 
-    image_path = output_dir / "images" / split_name / f"{sample_stem}{config.IMAGE_EXT}"
-    label_path = output_dir / "labels" / split_name / f"{sample_stem}.txt"
+    written: List[WrittenSample] = []
 
-    save_image(image, image_path)
-    save_label(label_path, yolo_boxes, class_id)
+    for variant, variant_image in augmented:
+        sample_stem = build_sample_stem(
+            slide_stem=slide_stem,
+            sample_type=sample_type,
+            sample_index=sample_index,
+            x0=x0,
+            y0=y0,
+            variant=variant,
+        )
 
-    return WrittenSample(
-        image_path=image_path,
-        label_path=label_path,
-        filename_stem=sample_stem,
-    )
+        image_path = (
+            output_dir / "images" / split_name / f"{sample_stem}{config.IMAGE_EXT}"
+        )
+        label_path = output_dir / "labels" / split_name / f"{sample_stem}.txt"
+
+        save_image(variant_image, image_path)
+        save_label(label_path, yolo_boxes, class_id)
+
+        written.append(
+            WrittenSample(
+                image_path=image_path,
+                label_path=label_path,
+                filename_stem=sample_stem,
+                variant=variant,
+            )
+        )
+
+    return written
 
 
 def save_image(image: Image.Image, image_path: Path) -> None:

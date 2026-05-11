@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-按 WSI 级别划分 train / val / test。
+按 WSI 级别划分 train / val。
 
 自动划分逻辑：
 1. 先读取每张 WSI 的 annotation 数量；
-2. 搜索 train / val / test 的所有分配方式；
+2. 搜索 train / val 的所有分配方式；
 3. 找到 annotation 数量比例最接近 SPLIT_RATIOS 的方案；
 4. slide 数量比例作为辅助约束。
 """
@@ -29,7 +29,6 @@ class SlideInfo:
 class SplitResult:
     train: List[SlidePair]
     val: List[SlidePair]
-    test: List[SlidePair]
     ann_counts: Dict[str, int]
     slide_counts: Dict[str, int]
     score: float
@@ -38,12 +37,11 @@ class SplitResult:
         return {
             "train": self.train,
             "val": self.val,
-            "test": self.test,
         }
 
 
 def has_manual_split(manual_split: Dict[str, Sequence[str]]) -> bool:
-    return any(bool(manual_split.get(k)) for k in ("train", "val", "test"))
+    return any(bool(manual_split.get(k)) for k in ("train", "val"))
 
 
 def split_slide_pairs(
@@ -104,12 +102,12 @@ def _auto_balance_split(
     slide_infos = list(slide_infos)
 
     n = len(slide_infos)
-    if n < 3:
-        raise ValueError("至少需要 3 张 WSI 才能划分 train / val / test。")
+    if n < 2:
+        raise ValueError("至少需要 2 张 WSI 才能划分 train / val。")
 
     _validate_split_ratios(split_ratios)
 
-    split_names = ("train", "val", "test")
+    split_names = ("train", "val")
     total_ann = sum(item.ann_count for item in slide_infos)
 
     if total_ann <= 0:
@@ -120,18 +118,16 @@ def _auto_balance_split(
     best_ann_counts: Dict[str, int] | None = None
     best_slide_counts: Dict[str, int] | None = None
 
-    # assignment 中每个元素取值 0/1/2，分别表示 train/val/test
-    for assignment in itertools.product(range(3), repeat=n):
+    # assignment 中每个元素取值 0/1，分别表示 train/val
+    for assignment in itertools.product(range(2), repeat=n):
         slide_counts = {
             "train": 0,
             "val": 0,
-            "test": 0,
         }
 
         ann_counts = {
             "train": 0,
             "val": 0,
-            "test": 0,
         }
 
         for idx, split_id in enumerate(assignment):
@@ -159,12 +155,11 @@ def _auto_balance_split(
             best_slide_counts = slide_counts
 
     if best_assignment is None or best_ann_counts is None or best_slide_counts is None:
-        raise RuntimeError("没有找到满足条件的 train / val / test 划分。")
+        raise RuntimeError("没有找到满足条件的 train / val 划分。")
 
     split_items = {
         "train": [],
         "val": [],
-        "test": [],
     }
 
     for idx, split_id in enumerate(best_assignment):
@@ -174,7 +169,6 @@ def _auto_balance_split(
     return SplitResult(
         train=split_items["train"],
         val=split_items["val"],
-        test=split_items["test"],
         ann_counts=best_ann_counts,
         slide_counts=best_slide_counts,
         score=best_score,
@@ -192,7 +186,7 @@ def _split_score(
 ) -> float:
     score = 0.0
 
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         target_ratio = split_ratios[split_name]
 
         ann_ratio = ann_counts[split_name] / total_ann
@@ -211,7 +205,7 @@ def _satisfy_min_slides(
     slide_counts: Dict[str, int],
     split_min_slides: Dict[str, int],
 ) -> bool:
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         min_count = int(split_min_slides.get(split_name, 1))
         if slide_counts[split_name] < min_count:
             return False
@@ -220,10 +214,10 @@ def _satisfy_min_slides(
 
 
 def _validate_split_ratios(split_ratios: Dict[str, float]) -> None:
-    required = {"train", "val", "test"}
+    required = {"train", "val"}
 
     if set(split_ratios.keys()) != required:
-        raise ValueError("SPLIT_RATIOS 必须包含 train / val / test。")
+        raise ValueError("SPLIT_RATIOS 必须包含 train / val。")
 
     total = sum(float(v) for v in split_ratios.values())
 
@@ -240,9 +234,8 @@ def _manual_split(
 
     train_stems = list(manual_split.get("train", []))
     val_stems = list(manual_split.get("val", []))
-    test_stems = list(manual_split.get("test", []))
 
-    all_stems = train_stems + val_stems + test_stems
+    all_stems = train_stems + val_stems
 
     if len(all_stems) != len(set(all_stems)):
         raise ValueError("MANUAL_SPLIT 中存在重复 slide stem。")
@@ -257,24 +250,20 @@ def _manual_split(
 
     train = [pair_map[stem] for stem in train_stems]
     val = [pair_map[stem] for stem in val_stems]
-    test = [pair_map[stem] for stem in test_stems]
 
     ann_counts = {
         "train": sum(ann_map[stem] for stem in train_stems),
         "val": sum(ann_map[stem] for stem in val_stems),
-        "test": sum(ann_map[stem] for stem in test_stems),
     }
 
     slide_counts = {
         "train": len(train),
         "val": len(val),
-        "test": len(test),
     }
 
     return SplitResult(
         train=train,
         val=val,
-        test=test,
         ann_counts=ann_counts,
         slide_counts=slide_counts,
         score=0.0,
@@ -289,7 +278,7 @@ def print_split_result(split_result: SplitResult) -> None:
     total_ann = sum(split_result.ann_counts.values())
     total_slides = sum(split_result.slide_counts.values())
 
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "val"):
         pairs = split_dict[split_name]
         ann_count = split_result.ann_counts[split_name]
         slide_count = split_result.slide_counts[split_name]

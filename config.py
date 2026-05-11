@@ -9,15 +9,14 @@ OUTPUT_DIR = Path(r"E:/dataset")
 LEVEL = 0
 TILE_SIZE = 768
 
-# 每个标注生成 3 张正样本：
-# 1 张中心切图 + 2 张随机偏移切图
-POS_PATCHES_PER_ANNOTATION = 3
-
-# 随机偏移范围：dx, dy ∈ [-JITTER, JITTER]
-JITTER = 128
+# 正样本 coverage-driven sampling
+POS_TARGET_COVERAGE = 2
+POS_SOURCE_MARGIN = 32
+POS_MAX_TRIES_PER_ANN = 80
+POS_MAX_TOTAL_TRIES_FACTOR = 120
 
 # 正负样本比例：
-NEG_POS_RATIO = 2
+NEG_POS_RATIO = 1
 
 
 # 数据集划分
@@ -38,17 +37,42 @@ SPLIT_SLIDE_WEIGHT = 0.15
 MANUAL_SPLIT = {
     "train": [],
     "val": [],
-    "test": [],
 }
 
 RANDOM_SEED = 42
+
+
+# 颜色增强配置
+ENABLE_COLOR_AUGMENT = True
+
+COLOR_AUGMENT_SPLITS = {"train"}
+
+COLOR_AUGMENT_VARIANTS = [
+    "orig",
+    "clahe",
+    "hsv",
+    "brightness_contrast",
+    "gamma",
+]
+
+CLAHE_CLIP_LIMIT_RANGE = (1.5, 2.5)
+CLAHE_TILE_GRID_SIZE = (8, 8)
+
+HSV_HUE_SHIFT_LIMIT = (-4, 4)
+HSV_SAT_SHIFT_LIMIT = (-12, 12)
+HSV_VAL_SHIFT_LIMIT = (-10, 10)
+
+BRIGHTNESS_LIMIT = (-0.08, 0.08)
+CONTRAST_LIMIT = (-0.10, 0.10)
+
+GAMMA_LIMIT = (90, 110)
 
 
 # 标签与样本过滤配置
 CLASS_ID = 0
 
 # 主目标可见比例。低于这个值，正样本候选作废并重新采样。
-SOURCE_MIN_VISIBLE_RATIO = 0.70
+SOURCE_MIN_VISIBLE_RATIO = 0.85
 
 # patch 内其他目标达到这个可见比例，就写入 YOLO 标签。
 LABEL_MIN_VISIBLE_RATIO = 0.15
