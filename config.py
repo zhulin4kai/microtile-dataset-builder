@@ -59,6 +59,30 @@ JPEG_QUALITY = 90
 USE_CV2_JPEG_WRITER = True
 WRITE_EMPTY_LABEL_FOR_NEGATIVE = True
 
+# 颜色增强（仅 train 生效，val 只写 orig）
+ENABLE_COLOR_AUGMENT = True
+
+COLOR_AUGMENT_SPLITS = {"train"}
+
+COLOR_AUGMENT_VARIANTS = [
+    "orig",
+    "clahe",
+    "hsv",
+    "brightness_contrast",
+    "gamma",
+]
+
+CLAHE_CLIP_LIMIT_RANGE = (1.5, 2.5)
+CLAHE_TILE_GRID_SIZE = (8, 8)
+
+HSV_HUE_SHIFT_LIMIT = (-4, 4)
+HSV_SAT_SHIFT_LIMIT = (-12, 12)
+HSV_VAL_SHIFT_LIMIT = (-10, 10)
+
+BRIGHTNESS_LIMIT = (-0.08, 0.08)
+CONTRAST_LIMIT = (-0.10, 0.10)
+
+GAMMA_LIMIT = (90, 110)
+
 # 禁用训练阶段才需要的功能
 REQUIRE_CUDA = False
-ENABLE_COLOR_AUGMENT = False

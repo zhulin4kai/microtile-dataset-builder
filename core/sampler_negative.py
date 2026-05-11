@@ -147,6 +147,7 @@ def generate_negative_samples_for_slide(
                     image=tile_result.image,
                     yolo_boxes=[],
                     class_id=config.CLASS_ID,
+                    rng=rng,
                 )
 
                 stats.saved += 1

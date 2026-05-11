@@ -3,19 +3,23 @@
 YOLO 数据写入模块（高性能版）。
 
 - 只支持 train / val。
-- 不做颜色增强。
+- train 支持颜色增强多版本输出。
 - JPEG 使用 cv2.imencode 加速写入。
+- save_image 同时接受 PIL Image 和 ndarray。
 """
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Union
 
+import numpy as np
 from PIL import Image
 
 import config
+from core.color_augment import make_color_augmented_images
 
 YoloBox = Tuple[float, float, float, float]
 
@@ -25,6 +29,7 @@ class WrittenSample:
     image_path: Path
     label_path: Path
     filename_stem: str
+    variant: str
 
 
 def prepare_output_dirs(output_dir: Path) -> None:
@@ -52,8 +57,9 @@ def build_sample_stem(
     sample_index: int,
     x0: int,
     y0: int,
+    variant: str = "orig",
 ) -> str:
-    return f"{slide_stem}_{sample_type}_{sample_index:06d}_x{x0}_y{y0}"
+    return f"{slide_stem}_{sample_type}_{sample_index:06d}_x{x0}_y{y0}_{variant}"
 
 
 def write_yolo_sample(
@@ -67,49 +73,72 @@ def write_yolo_sample(
     image: Image.Image,
     yolo_boxes: Sequence[YoloBox],
     class_id: int,
-) -> WrittenSample:
+    rng: random.Random,
+) -> List[WrittenSample]:
     """
-    保存一个 YOLO 样本。
+    保存一个 YOLO 样本（支持颜色增强多版本）。
+
+    train 且 ENABLE_COLOR_AUGMENT=True：
+        保存 orig + clahe + hsv + brightness_contrast + gamma
+
+    val：
+        只保存 orig
     """
     output_dir = Path(output_dir)
 
     if split_name not in ("train", "val"):
         raise ValueError(f"Invalid split_name: {split_name}")
 
-    sample_stem = build_sample_stem(
-        slide_stem=slide_stem,
-        sample_type=sample_type,
-        sample_index=sample_index,
-        x0=x0,
-        y0=y0,
-    )
+    variants = make_color_augmented_images(image, rng, split_name)
 
-    image_path = output_dir / "images" / split_name / f"{sample_stem}{config.IMAGE_EXT}"
-    label_path = output_dir / "labels" / split_name / f"{sample_stem}.txt"
+    written: List[WrittenSample] = []
 
-    save_image(image, image_path)
-    save_label(label_path, yolo_boxes, class_id)
+    for variant, variant_arr in variants:
+        sample_stem = build_sample_stem(
+            slide_stem=slide_stem,
+            sample_type=sample_type,
+            sample_index=sample_index,
+            x0=x0,
+            y0=y0,
+            variant=variant,
+        )
 
-    return WrittenSample(
-        image_path=image_path,
-        label_path=label_path,
-        filename_stem=sample_stem,
-    )
+        image_path = (
+            output_dir / "images" / split_name / f"{sample_stem}{config.IMAGE_EXT}"
+        )
+        label_path = output_dir / "labels" / split_name / f"{sample_stem}.txt"
+
+        save_image(variant_arr, image_path)
+        save_label(label_path, yolo_boxes, class_id)
+
+        written.append(
+            WrittenSample(
+                image_path=image_path,
+                label_path=label_path,
+                filename_stem=sample_stem,
+                variant=variant,
+            )
+        )
+
+    return written
 
 
-def save_image(image: Image.Image, image_path: Path) -> None:
+def save_image(image: Union[Image.Image, np.ndarray], image_path: Path) -> None:
     image_path.parent.mkdir(parents=True, exist_ok=True)
 
     suffix = image_path.suffix.lower()
 
     if config.USE_CV2_JPEG_WRITER and suffix in (".jpg", ".jpeg"):
         import cv2
-        import numpy as np
 
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        if isinstance(image, np.ndarray):
+            arr = image
+        else:
+            arr = np.asarray(image)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+                arr = np.asarray(image)
 
-        arr = np.asarray(image)
         arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
         ok, encoded = cv2.imencode(
             ".jpg",
@@ -120,6 +149,9 @@ def save_image(image: Image.Image, image_path: Path) -> None:
             raise RuntimeError(f"cv2.imencode failed: {image_path}")
         image_path.write_bytes(encoded.tobytes())
         return
+
+    if isinstance(image, np.ndarray):
+        image = Image.fromarray(image)
 
     if image.mode != "RGB":
         image = image.convert("RGB")
