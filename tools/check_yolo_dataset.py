@@ -1,5 +1,5 @@
 """
-YOLO 数据集抽查脚本。
+YOLO 数据集抽查脚本（高性能版）。
 
 运行方式：
     python tools/check_yolo_dataset.py
@@ -8,18 +8,17 @@ YOLO 数据集抽查脚本。
 1. 从 images/train、images/val 随机抽正样本；
 2. 从空 label 中随机抽负样本；
 3. 正样本画 YOLO bbox；
-4. 统计 train 中各 variant 数量（颜色增强检查）；
-5. 输出到 CHECK_OUTPUT_DIR，方便人工查看。
+4. 完整性检查（image/label 配对、坐标合法性）；
+5. 输出到 CHECK_OUTPUT_DIR。
 """
 
 from __future__ import annotations
 
 import random
-from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 # =========================
 # 配置
@@ -66,8 +65,21 @@ def main() -> None:
 
         pairs = collect_image_label_pairs(image_dir, label_dir)
 
+        # 完整性检查
+        image_names = {p.stem for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS}
+        label_names = {p.stem for p in label_dir.iterdir() if p.is_file() and p.suffix == ".txt"}
+
+        missing_labels = image_names - label_names
+        missing_images = label_names - image_names
+
+        if missing_labels:
+            print(f"[WARN] {len(missing_labels)} images without label")
+        if missing_images:
+            print(f"[WARN] {len(missing_images)} labels without image")
+
         pos_pairs = []
         neg_pairs = []
+        coord_errors = 0
 
         for image_path, label_path in pairs:
             labels = read_yolo_label(label_path)
@@ -76,17 +88,20 @@ def main() -> None:
             else:
                 neg_pairs.append((image_path, label_path))
 
+            # 坐标合法性检查
+            for cls, xc, yc, w, h in labels:
+                if not (0 <= xc <= 1 and 0 <= yc <= 1 and 0 < w <= 1 and 0 < h <= 1):
+                    coord_errors += 1
+                    print(f"[WARN] invalid YOLO coord: {label_path} cls={cls} xc={xc} yc={yc} w={w} h={h}")
+
+        if coord_errors > 0:
+            print(f"[WARN] {coord_errors} invalid YOLO coordinates")
+
         print(
             f"  total={len(pairs)}, "
             f"pos={len(pos_pairs)}, "
             f"neg={len(neg_pairs)}"
         )
-
-        # 统计 variant 数量
-        variant_counts = _count_variants(image_dir)
-        if variant_counts:
-            vc_str = " ".join(f"{k}={v}" for k, v in sorted(variant_counts.items()))
-            print(f"  variants: {vc_str}")
 
         sampled_pos = sample_pairs(pos_pairs, SAMPLES_PER_SPLIT_POS, rng)
         sampled_neg = sample_pairs(neg_pairs, SAMPLES_PER_SPLIT_NEG, rng)
@@ -104,29 +119,6 @@ def main() -> None:
         )
 
     print(f"[DONE] check results saved to: {CHECK_OUTPUT_DIR}")
-
-
-def _count_variants(image_dir: Path) -> Dict[str, int]:
-    """统计目录中各 variant 的文件数量。"""
-    variant_counter: Counter[str] = Counter()
-
-    for p in image_dir.iterdir():
-        if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
-            continue
-
-        stem = p.stem
-        # 期望格式: slide_pos_000001_x123_y456_variant
-        parts = stem.rsplit("_", 1)
-        if len(parts) == 2 and parts[1] in {
-            "orig",
-            "clahe",
-            "hsv",
-            "brightness_contrast",
-            "gamma",
-        }:
-            variant_counter[parts[1]] += 1
-
-    return dict(variant_counter)
 
 
 def collect_image_label_pairs(

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import concurrent.futures
+import multiprocessing as mp
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 from typing import Dict, List, Tuple
 
@@ -38,7 +39,12 @@ def main() -> None:
     stats_list: List[SlideProcessStats] = []
     failures: List[Tuple[str, str, str]] = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=config.NUM_WORKERS) as executor:
+    ctx = mp.get_context(config.PROCESS_START_METHOD)
+
+    with ProcessPoolExecutor(
+        max_workers=config.NUM_WORKERS,
+        mp_context=ctx,
+    ) as executor:
         future_map = {}
 
         for task_index, (split_name, pair) in enumerate(tasks):
@@ -59,7 +65,7 @@ def main() -> None:
             dynamic_ncols=True,
             leave=True,
         ) as pbar:
-            for future in concurrent.futures.as_completed(future_map):
+            for future in as_completed(future_map):
                 split_name, pair = future_map[future]
 
                 try:
@@ -89,6 +95,7 @@ def main() -> None:
 
     print("[ALL DONE] 数据集生成完成。")
 
+
 def _check_config() -> None:
     if config.TILE_SIZE <= 0:
         raise ValueError("TILE_SIZE must be positive.")
@@ -96,25 +103,14 @@ def _check_config() -> None:
     if config.LEVEL != 0:
         raise ValueError("当前工程方案固定使用 level 0。")
 
-    if config.POS_TARGET_COVERAGE <= 0:
-        raise ValueError("POS_TARGET_COVERAGE must be positive.")
-
-    if config.POS_MAX_TRIES_PER_ANN <= 0:
-        raise ValueError("POS_MAX_TRIES_PER_ANN must be positive.")
+    if config.POS_PATCHES_PER_ANNOTATION <= 0:
+        raise ValueError("POS_PATCHES_PER_ANNOTATION must be positive.")
 
     if config.NEG_POS_RATIO < 0:
         raise ValueError("NEG_POS_RATIO must be >= 0.")
 
     if config.NUM_WORKERS <= 0:
         raise ValueError("NUM_WORKERS must be positive.")
-
-    if config.REQUIRE_CUDA:
-        import torch
-
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "config.REQUIRE_CUDA=True，但当前环境 torch.cuda.is_available() 为 False。"
-            )
 
 
 def _build_tasks(split_result: SplitResult) -> List[Tuple[str, SlidePair]]:

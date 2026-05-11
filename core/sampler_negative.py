@@ -1,35 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-负样本采样模块。
+负样本采样模块（低分辨率 tissue mask + NumPy bbox 过滤）。
 
-调用关系：
-
-worker.py
-  -> generate_negative_samples_for_slide()
-       -> geometry_cuda.filter_candidate_tiles_without_boxes_cuda()
-       -> SlideReader.read_tile()
-       -> tissue_cuda.tissue_ratio_cuda()
-       -> yolo_writer.write_yolo_sample()
-
-负样本规则：
-1. 中心优先随机采样；
-2. 候选 tile 不得与 expanded annotation bbox 相交；
-3. tissue_ratio 必须达到阈值；
-4. 保存空 label。
+不依赖 CUDA，不依赖 torch。
 """
 
 from __future__ import annotations
 
-import math
 import random
 from dataclasses import dataclass
 from typing import Set, Tuple
-import torch
+
+import numpy as np
 
 import config
-from core.geometry import filter_candidate_tiles_without_boxes_cuda
+from core.fast_geometry import filter_candidate_tiles_without_boxes_np
+from core.fast_tissue import TissueMask, build_tissue_mask, tile_tissue_ratio_from_mask
 from core.slide_io import SlideReader
-from core.tissue import tissue_ratio_cuda
 from core.yolo_writer import write_yolo_sample
 
 
@@ -49,16 +36,18 @@ def generate_negative_samples_for_slide(
     slide_reader: SlideReader,
     slide_stem: str,
     split_name: str,
-    boxes_cuda: torch.Tensor,
-    device: torch.device,
+    boxes_np: np.ndarray,
     rng: random.Random,
     target_negative_count: int,
 ) -> NegativeSamplingStats:
     """
     为单张 WSI 生成负样本。
 
-    负样本数量由 worker 根据正样本保存数量计算：
-        target_negative_count = pos_saved * NEG_POS_RATIO
+    流程：
+    1. 构建低分辨率 tissue mask；
+    2. 批量生成候选坐标并用 NumPy 过滤 bbox；
+    3. 用 mask 过滤白背景；
+    4. 合格后才 read_tile；
     """
     stats = NegativeSamplingStats(requested=target_negative_count)
 
@@ -72,9 +61,11 @@ def generate_negative_samples_for_slide(
         stats.failed = target_negative_count
         return stats
 
+    tissue_mask = build_tissue_mask(slide_reader)
+
     used_origins: Set[Tuple[int, int]] = set()
 
-    radius_ratio = config.NEG_INITIAL_RADIUS_RATIO
+    radius_ratio = 0.20
     max_radius_ratio = 1.5
 
     sample_index = 1
@@ -85,9 +76,7 @@ def generate_negative_samples_for_slide(
             stats.saved < target_negative_count
             and tries < config.NEG_MAX_TRIES_PER_SLIDE
         ):
-            batch_size = _dynamic_batch_size(
-                remaining=target_negative_count - stats.saved
-            )
+            batch_size = min(8192, (target_negative_count - stats.saved) * 3)
 
             candidates = _generate_center_prior_candidates(
                 rng=rng,
@@ -101,54 +90,51 @@ def generate_negative_samples_for_slide(
             tries += len(candidates)
             stats.total_candidates += len(candidates)
 
-            candidates = _remove_duplicate_candidates(candidates, used_origins, stats)
+            # 去重
+            unique = []
+            for xy in candidates:
+                if xy not in used_origins:
+                    used_origins.add(xy)  # 乐观加入，后面可能有 false positive
+                    unique.append(xy)
+            candidates_np = np.array(unique, dtype=np.float32)
 
-            if not candidates:
-                radius_ratio = _grow_radius(radius_ratio, max_radius_ratio)
+            if candidates_np.shape[0] == 0:
+                radius_ratio = min(max_radius_ratio, radius_ratio + 0.15)
                 continue
 
-            candidates_tensor = torch.tensor(
-                candidates,
-                device=device,
-                dtype=torch.float32,
-            )
-
-            valid_mask = filter_candidate_tiles_without_boxes_cuda(
-                boxes=boxes_cuda,
-                candidates_xy=candidates_tensor,
+            # NumPy 过滤 bbox
+            valid_mask = filter_candidate_tiles_without_boxes_np(
+                boxes=boxes_np,
+                candidates_xy=candidates_np,
                 tile_size=tile_size,
                 margin=config.NEG_SAFE_MARGIN,
             )
 
-            valid_candidates = []
-            mask_cpu = valid_mask.detach().cpu().tolist()
+            valid = candidates_np[valid_mask]
+            rejected_count = (~valid_mask).sum()
+            stats.rejected_by_box += int(rejected_count)
 
-            for candidate, ok in zip(candidates, mask_cpu):
-                if ok:
-                    valid_candidates.append(candidate)
-                else:
-                    stats.rejected_by_box += 1
-
-            if not valid_candidates:
-                radius_ratio = _grow_radius(radius_ratio, max_radius_ratio)
+            if valid.shape[0] == 0:
+                radius_ratio = min(max_radius_ratio, radius_ratio + 0.15)
                 continue
 
-            for x0, y0 in valid_candidates:
+            # tissue mask 过滤 + read_tile
+            for i in range(valid.shape[0]):
                 if stats.saved >= target_negative_count:
                     break
 
-                used_origins.add((x0, y0))
+                x0 = int(valid[i, 0])
+                y0 = int(valid[i, 1])
 
-                tile_result = slide_reader.read_tile(x0, y0)
-
-                ratio = tissue_ratio_cuda(
-                    image=tile_result.image,
-                    device=device,
+                tissue_ratio = tile_tissue_ratio_from_mask(
+                    tissue_mask, x0, y0, tile_size
                 )
 
-                if ratio < config.TISSUE_RATIO_THRESHOLD:
+                if tissue_ratio < config.TISSUE_RATIO_THRESHOLD:
                     stats.rejected_by_tissue += 1
                     continue
+
+                tile_result = slide_reader.read_tile(x0, y0)
 
                 write_yolo_sample(
                     output_dir=config.OUTPUT_DIR,
@@ -161,14 +147,13 @@ def generate_negative_samples_for_slide(
                     image=tile_result.image,
                     yolo_boxes=[],
                     class_id=config.CLASS_ID,
-                    rng=rng,
                 )
 
                 stats.saved += 1
                 sample_index += 1
 
             if stats.saved < target_negative_count:
-                radius_ratio = _grow_radius(radius_ratio, max_radius_ratio)
+                radius_ratio = min(max_radius_ratio, radius_ratio + 0.15)
 
     finally:
         pass
@@ -179,20 +164,6 @@ def generate_negative_samples_for_slide(
     return stats
 
 
-def _dynamic_batch_size(remaining: int) -> int:
-    """
-    控制 CUDA 候选矩阵规模。
-
-    候选数 M 与 bbox 数 N 会形成 [M, N] 的相交矩阵。
-    这里不把 batch 设太大，避免 6G 显存上出现没必要的压力。
-    """
-    if remaining <= 32:
-        return 128
-    if remaining <= 128:
-        return 256
-    return 512
-
-
 def _generate_center_prior_candidates(
     rng: random.Random,
     slide_w: int,
@@ -201,12 +172,6 @@ def _generate_center_prior_candidates(
     radius_ratio: float,
     batch_size: int,
 ) -> list[tuple[int, int]]:
-    """
-    中心优先随机生成候选 tile 左上角。
-
-    radius_ratio 越大，采样范围越接近全图。
-    当 radius 足够大时，候选会自然覆盖到边缘。
-    """
     max_x = slide_w - tile_size
     max_y = slide_h - tile_size
 
@@ -233,27 +198,3 @@ def _generate_center_prior_candidates(
         candidates.append((x0, y0))
 
     return candidates
-
-
-def _remove_duplicate_candidates(
-    candidates: list[tuple[int, int]],
-    used_origins: Set[Tuple[int, int]],
-    stats: NegativeSamplingStats,
-) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-
-    local_seen: Set[Tuple[int, int]] = set()
-
-    for xy in candidates:
-        if xy in used_origins or xy in local_seen:
-            stats.duplicate_candidate += 1
-            continue
-
-        local_seen.add(xy)
-        result.append(xy)
-
-    return result
-
-
-def _grow_radius(radius_ratio: float, max_radius_ratio: float) -> float:
-    return min(max_radius_ratio, radius_ratio + config.NEG_RADIUS_GROWTH_RATIO)
