@@ -22,15 +22,13 @@ NEG_POS_RATIO = 2
 
 # 数据集划分
 SPLIT_RATIOS = {
-    "train": 0.70,
-    "val": 0.15,
-    "test": 0.15,
+    "train": 0.75,
+    "val": 0.25,
 }
 
 SPLIT_MIN_SLIDES = {
     "train": 1,
     "val": 1,
-    "test": 1,
 }
 
 # ann 数量平衡是主目标，slide 数量平衡是辅助目标
