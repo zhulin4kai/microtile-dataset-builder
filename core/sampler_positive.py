@@ -103,19 +103,49 @@ def generate_positive_samples_for_slide(
 
                 tile_result = slide_reader.read_tile(x0, y0)
 
-                write_yolo_sample(
-                    output_dir=config.OUTPUT_DIR,
-                    split_name=split_name,
-                    slide_stem=slide_stem,
-                    sample_type="pos",
-                    sample_index=sample_index,
-                    x0=tile_result.x0,
-                    y0=tile_result.y0,
-                    image=tile_result.image,
-                    yolo_boxes=eval_result.yolo_boxes,
-                    class_id=config.CLASS_ID,
-                    rng=rng,
-                )
+                if config.DATASET_TASK == "seg":
+                    from core.seg_geometry import build_yolo_segments_for_tile
+
+                    segments = build_yolo_segments_for_tile(
+                        annotations=list(annotations),
+                        label_indices=eval_result.label_indices,
+                        x0=x0,
+                        y0=y0,
+                        tile_size=config.TILE_SIZE,
+                    )
+                    if not segments:
+                        stats.failed += 1
+                        stats.no_valid_label += 1
+                        continue
+
+                    write_yolo_sample(
+                        output_dir=config.OUTPUT_DIR,
+                        split_name=split_name,
+                        slide_stem=slide_stem,
+                        sample_type="pos",
+                        sample_index=sample_index,
+                        x0=tile_result.x0,
+                        y0=tile_result.y0,
+                        image=tile_result.image,
+                        yolo_boxes=eval_result.yolo_boxes,
+                        class_id=config.CLASS_ID,
+                        rng=rng,
+                        yolo_segments=segments,
+                    )
+                else:
+                    write_yolo_sample(
+                        output_dir=config.OUTPUT_DIR,
+                        split_name=split_name,
+                        slide_stem=slide_stem,
+                        sample_type="pos",
+                        sample_index=sample_index,
+                        x0=tile_result.x0,
+                        y0=tile_result.y0,
+                        image=tile_result.image,
+                        yolo_boxes=eval_result.yolo_boxes,
+                        class_id=config.CLASS_ID,
+                        rng=rng,
+                    )
 
                 stats.saved += 1
                 sample_index += 1

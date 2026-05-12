@@ -112,6 +112,9 @@ def _check_config() -> None:
     if config.NUM_WORKERS <= 0:
         raise ValueError("NUM_WORKERS must be positive.")
 
+    if config.DATASET_TASK not in ("box", "seg"):
+        raise ValueError("DATASET_TASK must be 'box' or 'seg'.")
+
 
 def _build_tasks(split_result: SplitResult) -> List[Tuple[str, SlidePair]]:
     tasks: List[Tuple[str, SlidePair]] = []

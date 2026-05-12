@@ -86,3 +86,13 @@ GAMMA_LIMIT = (90, 110)
 
 # 禁用训练阶段才需要的功能
 REQUIRE_CUDA = False
+
+# ── 数据集任务类型 ──────────────────────────────────────────────────
+# "box": YOLO detect bbox 标签 (class xc yc w h)
+# "seg": YOLO segmentation 标签 (class x1 y1 x2 y2 ...)
+DATASET_TASK = "box"
+
+# segmentation 参数（仅 DATASET_TASK == "seg" 时生效）
+SEG_MIN_POLYGON_POINTS = 3
+SEG_MIN_POLYGON_AREA = 4.0
+SEG_SIMPLIFY_EPSILON = 0.0

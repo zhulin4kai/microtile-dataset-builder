@@ -74,9 +74,13 @@ def write_yolo_sample(
     yolo_boxes: Sequence[YoloBox],
     class_id: int,
     rng: random.Random,
+    yolo_segments: Sequence[Sequence[float]] | None = None,
 ) -> List[WrittenSample]:
     """
     保存一个 YOLO 样本（支持颜色增强多版本）。
+
+    box 模式 (config.DATASET_TASK == "box")：使用 yolo_boxes，写 bbox label。
+    seg 模式 (config.DATASET_TASK == "seg")：使用 yolo_segments，写 polygon label。
 
     train 且 ENABLE_COLOR_AUGMENT=True：
         保存 orig + clahe + hsv + brightness_contrast + gamma
@@ -109,7 +113,11 @@ def write_yolo_sample(
         label_path = output_dir / "labels" / split_name / f"{sample_stem}.txt"
 
         save_image(variant_arr, image_path)
-        save_label(label_path, yolo_boxes, class_id)
+
+        if config.DATASET_TASK == "seg" and yolo_segments is not None:
+            save_seg_label(label_path, yolo_segments, class_id)
+        else:
+            save_box_label(label_path, yolo_boxes, class_id)
 
         written.append(
             WrittenSample(
@@ -164,11 +172,12 @@ def save_image(image: Union[Image.Image, np.ndarray], image_path: Path) -> None:
         raise ValueError(f"Unsupported image extension: {image_path.suffix}")
 
 
-def save_label(
+def save_box_label(
     label_path: Path,
     yolo_boxes: Sequence[YoloBox],
     class_id: int,
 ) -> None:
+    """Write YOLO detect bbox label file (class xc yc w h)."""
     label_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines: List[str] = []
@@ -182,6 +191,36 @@ def save_label(
         lines.append(f"{class_id} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
 
     label_path.write_text("".join(lines), encoding="utf-8")
+
+
+def save_seg_label(
+    label_path: Path,
+    yolo_segments: Sequence[Sequence[float]],
+    class_id: int,
+) -> None:
+    """Write YOLO segmentation label file (class x1 y1 x2 y2 ...).
+
+    One row per polygon instance. Empty for negative samples.
+    """
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: List[str] = []
+    for seg in yolo_segments:
+        if len(seg) < config.SEG_MIN_POLYGON_POINTS * 2:
+            continue
+        coord_str = " ".join(f"{v:.6f}" for v in seg)
+        lines.append(f"{class_id} {coord_str}\n")
+
+    label_path.write_text("".join(lines), encoding="utf-8")
+
+
+def save_label(
+    label_path: Path,
+    yolo_boxes: Sequence[YoloBox],
+    class_id: int,
+) -> None:
+    """Backward-compatible alias for save_box_label."""
+    save_box_label(label_path, yolo_boxes, class_id)
 
 
 def _valid_yolo_box(xc: float, yc: float, w: float, h: float) -> bool:
