@@ -7,6 +7,9 @@
 2. 沿 bbox 长边做一个轻微偏移
 
 不重试，不 CUDA。
+
+box 模式：使用 evaluate_positive_tile_np() 做 bbox 可见性判断。
+seg 模式：使用 evaluate_seg_positive_tile()  做 polygon 可见性判断。
 """
 
 from __future__ import annotations
@@ -19,10 +22,10 @@ import numpy as np
 
 import config
 from core.fast_geometry import (
-    PositiveTileEvalResult,
     evaluate_positive_tile_np,
 )
 from core.geojson_parser import Annotation
+from core.seg_geometry import evaluate_seg_positive_tile
 from core.slide_io import SlideReader
 from core.yolo_writer import write_yolo_sample
 
@@ -48,9 +51,14 @@ def generate_positive_samples_for_slide(
 ) -> PositiveSamplingStats:
     """
     为单张 WSI 生成正样本（确定性快速）。
+
+    seg 模式：polygon-area visible ratio 决定标签。
+    box 模式：bbox visible ratio 决定标签。
     """
     stats = PositiveSamplingStats()
     sample_index = 1
+    is_seg = config.DATASET_TASK == "seg"
+    ann_list = list(annotations)
 
     try:
         for source_index, ann in enumerate(annotations):
@@ -59,7 +67,6 @@ def generate_positive_samples_for_slide(
             bw = x2 - x1
             bh = y2 - y1
 
-            # 决定偏移方向
             if bw >= bh:
                 offsets = [(0, 0), (int(bw * config.POS_OFFSET_RATIO), 0)]
             else:
@@ -68,7 +75,6 @@ def generate_positive_samples_for_slide(
             for dx, dy in offsets:
                 stats.requested += 1
 
-                # 以 bbox center 为中心计算 tile origin
                 cx = (x1 + x2) * 0.5
                 cy = (y1 + y2) * 0.5
 
@@ -77,17 +83,30 @@ def generate_positive_samples_for_slide(
 
                 x0, y0 = slide_reader.clamp_origin(x0, y0)
 
-                eval_result = evaluate_positive_tile_np(
-                    boxes=boxes_np,
-                    source_index=source_index,
-                    x0=x0,
-                    y0=y0,
-                    tile_size=config.TILE_SIZE,
-                    source_min_visible_ratio=config.SOURCE_MIN_VISIBLE_RATIO,
-                    label_min_visible_ratio=config.LABEL_MIN_VISIBLE_RATIO,
-                    ignore_max_visible_ratio=config.IGNORE_MAX_VISIBLE_RATIO,
-                    min_clipped_box_size=config.MIN_CLIPPED_BOX_SIZE,
-                )
+                # ── tile evaluation ────────────────────────────────
+                if is_seg:
+                    eval_result = evaluate_seg_positive_tile(
+                        annotations=ann_list,
+                        source_index=source_index,
+                        x0=x0,
+                        y0=y0,
+                        tile_size=config.TILE_SIZE,
+                        source_min_visible_ratio=config.SOURCE_MIN_VISIBLE_RATIO,
+                        label_min_visible_ratio=config.LABEL_MIN_VISIBLE_RATIO,
+                        ignore_max_visible_ratio=config.IGNORE_MAX_VISIBLE_RATIO,
+                    )
+                else:
+                    eval_result = evaluate_positive_tile_np(
+                        boxes=boxes_np,
+                        source_index=source_index,
+                        x0=x0,
+                        y0=y0,
+                        tile_size=config.TILE_SIZE,
+                        source_min_visible_ratio=config.SOURCE_MIN_VISIBLE_RATIO,
+                        label_min_visible_ratio=config.LABEL_MIN_VISIBLE_RATIO,
+                        ignore_max_visible_ratio=config.IGNORE_MAX_VISIBLE_RATIO,
+                        min_clipped_box_size=config.MIN_CLIPPED_BOX_SIZE,
+                    )
 
                 if not eval_result.ok:
                     stats.failed += 1
@@ -103,49 +122,20 @@ def generate_positive_samples_for_slide(
 
                 tile_result = slide_reader.read_tile(x0, y0)
 
-                if config.DATASET_TASK == "seg":
-                    from core.seg_geometry import build_yolo_segments_for_tile
-
-                    segments = build_yolo_segments_for_tile(
-                        annotations=list(annotations),
-                        label_indices=eval_result.label_indices,
-                        x0=x0,
-                        y0=y0,
-                        tile_size=config.TILE_SIZE,
-                    )
-                    if not segments:
-                        stats.failed += 1
-                        stats.no_valid_label += 1
-                        continue
-
-                    write_yolo_sample(
-                        output_dir=config.OUTPUT_DIR,
-                        split_name=split_name,
-                        slide_stem=slide_stem,
-                        sample_type="pos",
-                        sample_index=sample_index,
-                        x0=tile_result.x0,
-                        y0=tile_result.y0,
-                        image=tile_result.image,
-                        yolo_boxes=eval_result.yolo_boxes,
-                        class_id=config.CLASS_ID,
-                        rng=rng,
-                        yolo_segments=segments,
-                    )
-                else:
-                    write_yolo_sample(
-                        output_dir=config.OUTPUT_DIR,
-                        split_name=split_name,
-                        slide_stem=slide_stem,
-                        sample_type="pos",
-                        sample_index=sample_index,
-                        x0=tile_result.x0,
-                        y0=tile_result.y0,
-                        image=tile_result.image,
-                        yolo_boxes=eval_result.yolo_boxes,
-                        class_id=config.CLASS_ID,
-                        rng=rng,
-                    )
+                write_yolo_sample(
+                    output_dir=config.OUTPUT_DIR,
+                    split_name=split_name,
+                    slide_stem=slide_stem,
+                    sample_type="pos",
+                    sample_index=sample_index,
+                    x0=tile_result.x0,
+                    y0=tile_result.y0,
+                    image=tile_result.image,
+                    yolo_boxes=eval_result.yolo_boxes if hasattr(eval_result, "yolo_boxes") else [],
+                    class_id=config.CLASS_ID,
+                    rng=rng,
+                    yolo_segments=eval_result.yolo_segments if is_seg else None,
+                )
 
                 stats.saved += 1
                 sample_index += 1
