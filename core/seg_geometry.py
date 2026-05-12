@@ -73,9 +73,19 @@ def build_yolo_segments_for_tile(
                 # simplify the polygon in local space
                 pts = [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
                 simplified = Polygon(pts).simplify(config.SEG_SIMPLIFY_EPSILON)
+                # simplify may produce non-Polygon (MultiPolygon, empty, etc.)
+                polys = _to_polygon_list(simplified)
+                if not polys:
+                    continue
                 flat = []
-                for (lx, ly) in simplified.exterior.coords:
-                    flat.extend([lx, ly])
+                for sp in polys:
+                    coords_s = list(sp.exterior.coords)
+                    if len(coords_s) >= 2 and coords_s[0] == coords_s[-1]:
+                        coords_s = coords_s[:-1]
+                    if len(coords_s) < config.SEG_MIN_POLYGON_POINTS:
+                        continue
+                    for (lx, ly) in coords_s:
+                        flat.extend([lx, ly])
                 if len(flat) < config.SEG_MIN_POLYGON_POINTS * 2:
                     continue
 

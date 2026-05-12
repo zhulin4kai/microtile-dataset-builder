@@ -114,10 +114,17 @@ def write_yolo_sample(
 
         save_image(variant_arr, image_path)
 
-        if config.DATASET_TASK == "seg" and yolo_segments is not None:
+        if config.DATASET_TASK == "seg":
+            if yolo_segments is None:
+                raise ValueError(
+                    "DATASET_TASK='seg' but yolo_segments is None. "
+                    "seg mode requires explicit polygon data."
+                )
             save_seg_label(label_path, yolo_segments, class_id)
-        else:
+        elif config.DATASET_TASK == "box":
             save_box_label(label_path, yolo_boxes, class_id)
+        else:
+            raise ValueError(f"Invalid DATASET_TASK: {config.DATASET_TASK}")
 
         written.append(
             WrittenSample(
