@@ -150,11 +150,16 @@ def _rasterize_polygon_to_mask(
     points: List,
     x0: int,
     y0: int,
-    size: int,
+    tile_size: int,
+    target_size: int,
 ) -> np.ndarray:
-    """cv2.fillPoly a list of (gx, gy) points into a size x size uint8 mask."""
-    local = np.array([(px - x0, py - y0) for (px, py) in points], dtype=np.int32)
-    mask = np.zeros((size, size), dtype=np.uint8)
+    """cv2.fillPoly a list of (gx, gy) points into a target_size x target_size uint8 mask."""
+    scale = target_size / tile_size
+    local = np.array(
+        [(round((px - x0) * scale), round((py - y0) * scale)) for (px, py) in points],
+        dtype=np.int32,
+    )
+    mask = np.zeros((target_size, target_size), dtype=np.uint8)
     if local.shape[0] >= 3:
         cv2.fillPoly(mask, [local], 255)
     return mask
@@ -172,7 +177,7 @@ def _rasterize_and_clean_for_tile(
     if len(pts) < 3:
         return None
 
-    mask = _rasterize_polygon_to_mask(pts, x0, y0, target_size)
+    mask = _rasterize_polygon_to_mask(pts, x0, y0, tile_size, target_size)
     if mask.max() == 0:
         return None
 
@@ -276,6 +281,7 @@ def _estimate_annotation_mask_area(ann: Annotation) -> float:
 
 
 def _get_original_area(ann: Annotation) -> float:
-    if ann.index not in _ANN_AREA_CACHE:
-        _ANN_AREA_CACHE[ann.index] = _estimate_annotation_mask_area(ann)
-    return _ANN_AREA_CACHE[ann.index]
+    key = ann.feature_id
+    if key not in _ANN_AREA_CACHE:
+        _ANN_AREA_CACHE[key] = _estimate_annotation_mask_area(ann)
+    return _ANN_AREA_CACHE[key]
