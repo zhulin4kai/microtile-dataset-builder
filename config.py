@@ -2,11 +2,11 @@ from pathlib import Path
 import os
 
 # 路径配置
-TARGET_DIR = Path("/data/wsi/annotations")
-OUTPUT_DIR = Path("/data/dataset_yolo")
+TARGET_DIR = Path("/home/yuzhoukai/projects/WSIs")
+OUTPUT_DIR = Path("/home/yuzhoukai/projects/ultralytics/dataset")
 
 LEVEL = 0
-TILE_SIZE = 768
+TILE_SIZE = 1024
 
 SPLIT_RATIOS = {
     "train": 0.75,
