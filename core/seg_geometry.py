@@ -2,21 +2,28 @@
 """
 Segmentation polygon clipping and tile evaluation module.
 
-Uses shapely to:
-  - evaluate tile quality by polygon-area visible ratio (not bbox).
-  - clip annotation polygons to a tile's Level-0 rectangle.
-  - output YOLO segmentation label format (normalized [0,1] coordinates).
+Uses raster-mask + contour extraction instead of Shapely exterior
+to avoid brush-annotation degradation (triangles / noise fragments).
+
+Pipeline per annotation per tile:
+  1. rasterize GeoJSON polygon to tile-local uint8 mask
+  2. clean mask (keep largest component, fill holes, filter small fragments)
+  3. findContours -> approxPolyDP -> YOLO seg format
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List
+
+import cv2
+import numpy as np
 
 import config
 from core.geojson_parser import Annotation
-from shapely.geometry import box as shapely_box, Polygon, MultiPolygon, GeometryCollection
-from shapely.validation import make_valid
+
+# cache annotation original mask area (keyed by ann.index)
+_ANN_AREA_CACHE: Dict[int, float] = {}
 
 
 @dataclass(frozen=True)
@@ -42,34 +49,34 @@ def evaluate_seg_positive_tile(
     label_min_visible_ratio: float,
     ignore_max_visible_ratio: float,
 ) -> SegTileEvalResult:
-    """Evaluate a tile for seg mode using polygon-area visible ratios.
+    """Evaluate a tile for seg mode using mask-area visible ratios.
 
-    Only the source annotation must meet source_min_visible_ratio.
-    Other annotations contribute label data when visible >= label_min_visible_ratio.
-    Ambiguous annotations (between ignore and label thresholds) cause tile rejection.
+    Rasterizes each annotation polygon into tile-local mask, cleans it,
+    then computes visible_ratio = visible_px / original_px.
     """
-    tile_rect = shapely_box(x0, y0, x0 + tile_size, y0 + tile_size)
+    ss = max(1, int(config.SEG_MASK_SUPERSAMPLE))
+    tw = tile_size * ss
 
     visible_ratios: List[float] = []
-    clipped_geoms: List = []
+    tile_masks: List[np.ndarray | None] = []
 
     for ann in annotations:
-        geom = _make_valid_polygon(ann.polygon)
-        if geom is None or geom.is_empty or geom.area <= 0:
+        clean = _rasterize_and_clean_for_tile(ann, x0, y0, tile_size, tw)
+
+        if clean is None or clean.max() == 0:
             visible_ratios.append(0.0)
-            clipped_geoms.append(None)
+            tile_masks.append(None)
             continue
 
-        clipped = geom.intersection(tile_rect)
-        if clipped.is_empty:
-            visible_ratios.append(0.0)
-            clipped_geoms.append(None)
-            continue
+        visible_px = int(np.count_nonzero(clean))
+        orig_px = _get_original_area(ann)
 
-        visible_area = _polygon_area_sum(clipped)
-        ratio = visible_area / max(geom.area, 1e-6)
+        ratio = visible_px / max(orig_px, 1.0)
         visible_ratios.append(float(ratio))
-        clipped_geoms.append(clipped)
+
+        if ss > 1:
+            clean = cv2.resize(clean, (tile_size, tile_size), interpolation=cv2.INTER_NEAREST)
+        tile_masks.append(clean)
 
     source_visible = visible_ratios[source_index]
 
@@ -86,12 +93,12 @@ def evaluate_seg_positive_tile(
 
     for idx, ratio in enumerate(visible_ratios):
         if ratio >= label_min_visible_ratio:
-            segs = _clipped_geom_to_yolo_segments(
-                clipped_geoms[idx], x0, y0, tile_size,
-            )
-            if segs:
-                label_indices.append(idx)
-                segments.extend(segs)
+            mask = tile_masks[idx]
+            if mask is not None:
+                segs = _mask_to_yolo_segments(mask, tile_size)
+                if segs:
+                    label_indices.append(idx)
+                    segments.extend(segs)
         elif ratio >= ignore_max_visible_ratio:
             ambiguous_count += 1
 
@@ -125,104 +132,150 @@ def build_yolo_segments_for_tile(
     y0: int,
     tile_size: int,
 ) -> List[List[float]]:
-    """Clip named Annotation polygons to a tile and return YOLO seg format.
-
-    This is the lightweight variant — no per-annotation visible ratio check.
-    Use evaluate_seg_positive_tile() for full tile evaluation.
-    """
-    tile_rect = shapely_box(x0, y0, x0 + tile_size, y0 + tile_size)
-    segments: List[List[float]] = []
-
+    """Lightweight mask-based segment builder (no ratio check)."""
+    result: List[List[float]] = []
     for idx in label_indices:
         ann = annotations[idx]
-        geom = _make_valid_polygon(ann.polygon)
-        if geom is None:
-            continue
-
-        clipped = tile_rect.intersection(geom)
-        if clipped.is_empty:
-            continue
-
-        segs = _clipped_geom_to_yolo_segments(clipped, x0, y0, tile_size)
-        segments.extend(segs)
-
-    return segments
+        clean = _rasterize_and_clean_for_tile(ann, x0, y0, tile_size, tile_size)
+        if clean is not None and clean.max() > 0:
+            segs = _mask_to_yolo_segments(clean, tile_size)
+            result.extend(segs)
+    return result
 
 
-# ── internal helpers ─────────────────────────────────────────────────────────
+# ── internal: rasterize + clean ──────────────────────────────────────────────
 
 
-def _make_valid_polygon(points) -> Polygon | None:
-    if len(points) < 3:
-        return None
-    try:
-        geom = Polygon(points)
-        if not geom.is_valid:
-            geom = make_valid(geom)
-        return geom
-    except Exception:
-        return None
+def _rasterize_polygon_to_mask(
+    points: List,
+    x0: int,
+    y0: int,
+    size: int,
+) -> np.ndarray:
+    """cv2.fillPoly a list of (gx, gy) points into a size x size uint8 mask."""
+    local = np.array([(px - x0, py - y0) for (px, py) in points], dtype=np.int32)
+    mask = np.zeros((size, size), dtype=np.uint8)
+    if local.shape[0] >= 3:
+        cv2.fillPoly(mask, [local], 255)
+    return mask
 
 
-def _polygon_area_sum(geom) -> float:
-    if isinstance(geom, Polygon):
-        return geom.area
-    if isinstance(geom, (MultiPolygon, GeometryCollection)):
-        return sum(g.area for g in geom.geoms if isinstance(g, Polygon))
-    return 0.0
-
-
-def _clipped_geom_to_yolo_segments(
-    clipped,
+def _rasterize_and_clean_for_tile(
+    ann: Annotation,
     x0: int,
     y0: int,
     tile_size: int,
-) -> List[List[float]]:
-    """Convert a clipped shapely geometry into normalized YOLO seg lists."""
-    result: List[List[float]] = []
-    polys = _to_polygon_list(clipped)
+    target_size: int,
+) -> np.ndarray | None:
+    """Rasterize annotation polygon to target_size mask, then clean."""
+    pts = ann.polygon
+    if len(pts) < 3:
+        return None
 
-    for poly in polys:
-        coords = list(poly.exterior.coords)
-        if len(coords) >= 2 and coords[0] == coords[-1]:
-            coords = coords[:-1]
-        if len(coords) < config.SEG_MIN_POLYGON_POINTS:
+    mask = _rasterize_polygon_to_mask(pts, x0, y0, target_size)
+    if mask.max() == 0:
+        return None
+
+    return _clean_instance_mask(mask)
+
+
+def _clean_instance_mask(mask: np.ndarray) -> np.ndarray:
+    """Remove small fragments, keep largest component, fill holes."""
+    if mask.max() == 0:
+        return mask
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.zeros_like(mask)
+
+    # sort by area descending
+    areas = [cv2.contourArea(c) for c in contours]
+    if not areas:
+        return np.zeros_like(mask)
+
+    if config.SEG_KEEP_LARGEST_COMPONENT:
+        largest_idx = int(np.argmax(areas))
+        largest_area = areas[largest_idx]
+        kept = [contours[largest_idx]]
+    else:
+        largest_area = max(areas)
+        kept = []
+        for c, a in zip(contours, areas):
+            if a >= config.SEG_MIN_COMPONENT_AREA and a >= largest_area * config.SEG_MIN_COMPONENT_AREA_RATIO:
+                kept.append(c)
+
+    clean = np.zeros_like(mask)
+    cv2.drawContours(clean, kept, -1, 255, thickness=-1)
+
+    if config.SEG_FILL_HOLES:
+        contours2, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours2:
+            largest2 = max(contours2, key=cv2.contourArea)
+            clean[:] = 0
+            cv2.drawContours(clean, [largest2], -1, 255, thickness=-1)
+
+    return clean
+
+
+# ── internal: mask -> YOLO segments ──────────────────────────────────────────
+
+
+def _mask_to_yolo_segments(
+    mask: np.ndarray,
+    tile_size: int,
+) -> List[List[float]]:
+    """Extract contours from clean mask and return normalized YOLO seg lists."""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    result: List[List[float]] = []
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < config.SEG_MIN_POLYGON_AREA:
             continue
-        if poly.area < config.SEG_MIN_POLYGON_AREA:
+
+        approx = cv2.approxPolyDP(c, config.SEG_CONTOUR_APPROX_EPSILON, closed=True)
+        pts = approx.squeeze(1)
+        if pts.ndim != 2 or pts.shape[0] < config.SEG_MIN_POLYGON_POINTS:
             continue
 
         flat: List[float] = []
-        for (gx, gy) in coords:
-            nx = max(0.0, min(1.0, (gx - x0) / tile_size))
-            ny = max(0.0, min(1.0, (gy - y0) / tile_size))
+        for (lx, ly) in pts.astype(np.float64):
+            nx = max(0.0, min(1.0, lx / tile_size))
+            ny = max(0.0, min(1.0, ly / tile_size))
             flat.extend([nx, ny])
 
-        if config.SEG_SIMPLIFY_EPSILON > 0:
-            pts = [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
-            simplified = Polygon(pts).simplify(config.SEG_SIMPLIFY_EPSILON)
-            sub_polys = _to_polygon_list(simplified)
-            if not sub_polys:
-                continue
-            flat = []
-            for sp in sub_polys:
-                cs = list(sp.exterior.coords)
-                if len(cs) >= 2 and cs[0] == cs[-1]:
-                    cs = cs[:-1]
-                if len(cs) < config.SEG_MIN_POLYGON_POINTS:
-                    continue
-                for (lx, ly) in cs:
-                    flat.extend([lx, ly])
-            if len(flat) < config.SEG_MIN_POLYGON_POINTS * 2:
-                continue
+        # remove closing duplicate
+        if len(flat) >= 4 and flat[0] == flat[-2] and flat[1] == flat[-1]:
+            flat = flat[:-2]
+
+        if len(flat) < config.SEG_MIN_POLYGON_POINTS * 2:
+            continue
 
         result.append(flat)
 
     return result
 
 
-def _to_polygon_list(geom) -> list:
-    if isinstance(geom, Polygon):
-        return [geom]
-    if isinstance(geom, (MultiPolygon, GeometryCollection)):
-        return [g for g in geom.geoms if isinstance(g, Polygon)]
-    return []
+# ── internal: original area estimation ───────────────────────────────────────
+
+
+def _estimate_annotation_mask_area(ann: Annotation) -> float:
+    """Rasterize polygon in its bbox-local ROI and return clean pixel area."""
+    x1, y1, x2, y2 = ann.bbox
+    bw = int(x2 - x1) + 1
+    bh = int(y2 - y1) + 1
+
+    local_pts = [(px - x1, py - y1) for (px, py) in ann.polygon]
+    mask = np.zeros((bh, bw), dtype=np.uint8)
+    pts_arr = np.array(local_pts, dtype=np.int32).reshape(-1, 1, 2)
+    if pts_arr.shape[0] >= 3:
+        cv2.fillPoly(mask, [pts_arr], 255)
+
+    clean = _clean_instance_mask(mask)
+    return float(np.count_nonzero(clean))
+
+
+def _get_original_area(ann: Annotation) -> float:
+    if ann.index not in _ANN_AREA_CACHE:
+        _ANN_AREA_CACHE[ann.index] = _estimate_annotation_mask_area(ann)
+    return _ANN_AREA_CACHE[ann.index]
