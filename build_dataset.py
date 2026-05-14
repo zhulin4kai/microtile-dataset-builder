@@ -1,192 +1,208 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+YOLO detect dataset builder.
+
+Entry point:  python build_dataset.py
+"""
+
 from __future__ import annotations
 
-import multiprocessing as mp
-import traceback
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
-from typing import Dict, List, Tuple
+import os
+import random
+import shutil
+from pathlib import Path
 
 import config
-from core.discover import SlidePair, discover_slide_pairs, print_slide_pairs
-from core.split import SplitResult, print_split_result, split_slide_pairs
-from core.worker import SlideProcessStats, process_one_slide
-from core.yolo_writer import prepare_output_dirs
+from annotation import (
+    Annotation, bbox_intersects_tile, bbox_to_yolo,
+    clip_bbox_to_tile, load_annotations,
+)
+from augment_writer import save_box_label, save_image_variants
+from slide_io import SlideReader
+
+WSI_EXTENSIONS = {".svs", ".tif", ".tiff", ".ndpi", ".mrxs"}
+GT_EXTENSIONS = {".geojson", ".json"}
 
 
 def main() -> None:
-    _check_config()
+    rng = random.Random(config.RANDOM_SEED)
 
-    prepare_output_dirs(config.OUTPUT_DIR)
+    # 1. rebuild output dir
+    if config.OUTPUT_DIR.exists():
+        shutil.rmtree(config.OUTPUT_DIR)
+    for split in ("train", "val"):
+        (config.OUTPUT_DIR / "images" / split).mkdir(parents=True, exist_ok=True)
+        (config.OUTPUT_DIR / "labels" / split).mkdir(parents=True, exist_ok=True)
 
-    pairs = discover_slide_pairs(config.TARGET_DIR)
-    print_slide_pairs(pairs)
+    # 2. discover slide + annotation pairs
+    pairs: list[tuple[Path, Path]] = []
+    for fname in sorted(os.listdir(config.TARGET_DIR)):
+        stem, ext = os.path.splitext(fname)
+        if ext.lower() in WSI_EXTENSIONS:
+            wsi_path = config.TARGET_DIR / fname
+            gt_path = _find_gt(wsi_path)
+            if gt_path is not None:
+                pairs.append((wsi_path, gt_path))
+    print(f"Found {len(pairs)} slide-annotation pairs")
 
-    if config.DATASET_SPLIT_MODE == "wsi":
-        split_result = split_slide_pairs(
-            pairs=pairs,
-            split_ratios=config.SPLIT_RATIOS,
-            split_min_slides=config.SPLIT_MIN_SLIDES,
-            ann_weight=config.SPLIT_ANN_WEIGHT,
-            slide_weight=config.SPLIT_SLIDE_WEIGHT,
-            manual_split=config.MANUAL_SPLIT,
-        )
-        print_split_result(split_result)
-        tasks = _build_tasks(split_result)
-    else:
-        print("[INFO] 使用 patch group-level 划分：所有 WSI 都参与生成，样本写入时再随机分 train/val")
-        tasks = [("patch", pair) for pair in pairs]
+    # 3. generate raw positive patches + negative patches per slide
+    pos_groups: list[dict] = []
+    neg_groups: list[dict] = []
+    total_pos = 0
+    total_neg = 0
 
-    print(f"[INFO] 准备开始切图，任务数：{len(tasks)}，workers={config.NUM_WORKERS}")
+    for wsi_path, gt_path in pairs:
+        slide_stem = os.path.splitext(os.path.basename(wsi_path))[0]
+        annotations = load_annotations(gt_path)
+        if not annotations:
+            continue
 
-    stats_list: List[SlideProcessStats] = []
-    failures: List[Tuple[str, str, str]] = []
+        reader = SlideReader(str(wsi_path))
+        try:
+            w, h = reader.dimensions
+            ts = config.TILE_SIZE
 
-    ctx = mp.get_context(config.PROCESS_START_METHOD)
+            # positive: 1 patch per annotation, centered on bbox
+            slide_pos: list[dict] = []
+            for ann in annotations:
+                x1, y1, x2, y2 = ann.bbox
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                x0 = cx - ts // 2
+                y0 = cy - ts // 2
+                x0, y0 = reader.clamp_origin(x0, y0, ts)
 
-    with ProcessPoolExecutor(
-        max_workers=config.NUM_WORKERS,
-        mp_context=ctx,
-    ) as executor:
-        future_map = {}
+                img = reader.read_tile(x0, y0, ts)
 
-        for task_index, (split_name, pair) in enumerate(tasks):
-            worker_seed = config.RANDOM_SEED + task_index * 1009
+                # collect labels: all bboxes intersecting this tile
+                boxes: list[tuple] = []
+                for a in annotations:
+                    if bbox_intersects_tile(a.bbox, x0, y0, ts):
+                        clipped = clip_bbox_to_tile(a.bbox, x0, y0, ts)
+                        if clipped is not None:
+                            yb = bbox_to_yolo(clipped, ts)
+                            if yb[2] > 0 and yb[3] > 0:
+                                boxes.append(yb)
 
-            future = executor.submit(
-                process_one_slide,
-                pair,
-                split_name,
-                worker_seed,
-            )
-            future_map[future] = (split_name, pair)
+                slide_pos.append({
+                    "slide_stem": slide_stem,
+                    "index": len(pos_groups) + len(slide_pos) + 1,
+                    "x0": x0, "y0": y0,
+                    "img": img,
+                    "boxes": boxes,
+                })
 
-        with tqdm(
-            total=len(future_map),
-            desc="Generating WSI dataset",
-            unit="slide",
-            dynamic_ncols=True,
-            leave=True,
-        ) as pbar:
-            for future in as_completed(future_map):
-                split_name, pair = future_map[future]
+            # negative: random N patches not intersecting any annotation bbox
+            n_neg = len(slide_pos)
+            slide_neg: list[dict] = []
+            max_tries = n_neg * 100
+            tries = 0
+            seen: set[tuple] = set()
 
-                try:
-                    stats = future.result()
-                    stats_list.append(stats)
+            while len(slide_neg) < n_neg and tries < max_tries:
+                tries += 1
+                x0 = rng.randint(0, max(0, w - ts))
+                y0 = rng.randint(0, max(0, h - ts))
+                key = (x0, y0)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if any(bbox_intersects_tile(a.bbox, x0, y0, ts) for a in annotations):
+                    continue
 
-                    pbar.set_postfix_str(
-                        f"{split_name}/{pair.stem} "
-                        f"pos={stats.positive.saved} "
-                        f"neg={stats.negative.saved}"
-                    )
+                img = reader.read_tile(x0, y0, ts)
+                slide_neg.append({
+                    "slide_stem": slide_stem,
+                    "index": len(pos_groups) + len(slide_pos) + len(slide_neg) + 1,
+                    "x0": x0, "y0": y0,
+                    "img": img,
+                    "boxes": [],
+                })
 
-                except Exception as e:
-                    tb = traceback.format_exc()
-                    failures.append((split_name, pair.stem, str(e)))
+            if len(slide_neg) < n_neg:
+                print(f"  [{slide_stem}] negative: got {len(slide_neg)} / {n_neg} after {tries} tries")
 
-                    pbar.write(f"[ERROR] {split_name} | {pair.stem} | {e}")
-                    pbar.write(tb)
+            pos_groups.extend(slide_pos)
+            neg_groups.extend(slide_neg)
+            total_pos += len(slide_pos)
+            total_neg += len(slide_neg)
+            print(f"  [{slide_stem}] pos={len(slide_pos)} neg={len(slide_neg)}")
 
-                finally:
-                    pbar.update(1)
+        finally:
+            reader.close()
 
-    _print_summary(stats_list, failures)
+    print(f"\nRaw: total_pos={total_pos}  total_neg={total_neg}")
 
-    if failures:
-        raise RuntimeError(f"部分 WSI 处理失败，失败数量：{len(failures)}")
+    # 4. split
+    all_groups = pos_groups + neg_groups
+    rng.shuffle(all_groups)
 
-    print("[ALL DONE] 数据集生成完成。")
+    n_train = int(len(all_groups) * config.SPLIT_RATIOS["train"])
+    for group in all_groups[:n_train]:
+        group["split"] = "train"
+    for group in all_groups[n_train:]:
+        group["split"] = "val"
 
+    # 5. write images + labels
+    saved_train = saved_val = 0
+    label_dir = config.OUTPUT_DIR / "labels"
 
-def _check_config() -> None:
-    if config.TILE_SIZE <= 0:
-        raise ValueError("TILE_SIZE must be positive.")
+    for group in all_groups:
+        split = group["split"]
+        stem = _build_stem(group["slide_stem"], "pos" if group["boxes"] else "neg",
+                           group["index"], group["x0"], group["y0"])
 
-    if config.LEVEL != 0:
-        raise ValueError("当前工程方案固定使用 level 0。")
-
-    if config.POS_PATCHES_PER_ANNOTATION <= 0:
-        raise ValueError("POS_PATCHES_PER_ANNOTATION must be positive.")
-
-    if config.NEG_POS_RATIO < 0:
-        raise ValueError("NEG_POS_RATIO must be >= 0.")
-
-    if config.NUM_WORKERS <= 0:
-        raise ValueError("NUM_WORKERS must be positive.")
-
-    if config.DATASET_TASK not in ("box", "seg"):
-        raise ValueError("DATASET_TASK must be 'box' or 'seg'.")
-    if config.DATASET_SPLIT_MODE not in ("wsi", "patch"):
-        raise ValueError("DATASET_SPLIT_MODE must be 'wsi' or 'patch'.")
-
-
-def _build_tasks(split_result: SplitResult) -> List[Tuple[str, SlidePair]]:
-    tasks: List[Tuple[str, SlidePair]] = []
-
-    split_dict = split_result.as_dict()
-
-    for split_name in ("train", "val"):
-        for pair in split_dict[split_name]:
-            tasks.append((split_name, pair))
-
-    return tasks
-
-
-def _print_summary(
-    stats_list: List[SlideProcessStats],
-    failures: List[Tuple[str, str, str]],
-) -> None:
-    print("\n========== SUMMARY ==========")
-
-    total_pos_requested = 0
-    total_pos_saved = 0
-    total_neg_requested = 0
-    total_neg_saved = 0
-
-    split_summary: Dict[str, Dict[str, int]] = {
-        "train": {"pos": 0, "neg": 0},
-        "val": {"pos": 0, "neg": 0},
-    }
-
-    for stats in sorted(stats_list, key=lambda s: (s.split_name, s.slide_stem)):
-        pos = stats.positive
-        neg = stats.negative
-
-        total_pos_requested += pos.requested
-        total_pos_saved += pos.saved
-        total_neg_requested += neg.requested
-        total_neg_saved += neg.saved
-
-        if stats.split_name not in split_summary:
-            split_summary[stats.split_name] = {"pos": 0, "neg": 0}
-        split_summary[stats.split_name]["pos"] += pos.saved
-        split_summary[stats.split_name]["neg"] += neg.saved
-
-        print(
-            f"{stats.split_name:5s} | {stats.slide_stem:30s} | "
-            f"ann={stats.annotation_count:4d} | "
-            f"pos={pos.saved:5d}/{pos.requested:5d} | "
-            f"neg={neg.saved:5d}/{neg.requested:5d} | "
-            f"ambiguous={pos.ambiguous_edge_target:4d} | "
-            f"neg_box_rej={neg.rejected_by_box:6d} | "
-            f"neg_tissue_rej={neg.rejected_by_tissue:6d}"
+        variant_stems = save_image_variants(
+            arr=group["img"], stem=stem, split_name=split, rng=rng,
         )
 
-    print("\n[Split]")
-    for split_name in ("train", "val"):
-        item = split_summary[split_name]
-        print(f"  {split_name}: pos={item['pos']}, neg={item['neg']}")
+        for vstem in variant_stems:
+            label_path = label_dir / split / f"{vstem}.txt"
+            save_box_label(label_path, group["boxes"])
 
-    print("\n[Total]")
-    print(f"  positive: {total_pos_saved}/{total_pos_requested}")
-    print(f"  negative: {total_neg_saved}/{total_neg_requested}")
+        if split == "train":
+            saved_train += len(variant_stems)
+        else:
+            saved_val += len(variant_stems)
 
-    if failures:
-        print("\n[Failures]")
-        for split_name, stem, reason in failures:
-            print(f"  {split_name} | {stem} | {reason}")
+    print(f"\nWritten: train={saved_train} val={saved_val} total={saved_train + saved_val}")
 
-    print("=============================\n")
+    # 6. write dataset.yaml
+    _write_dataset_yaml()
+    print(f"\nDone. dataset.yaml written.")
+    print(f"Output: {config.OUTPUT_DIR}")
+
+
+def _find_gt(wsi_path: Path) -> Path | None:
+    stem = wsi_path.stem
+    for ext in GT_EXTENSIONS:
+        candidate = wsi_path.with_name(stem + ext)
+        if candidate.is_file():
+            return candidate
+        # also try removing multi-extension (e.g. .ome.tiff -> .geojson)
+        for subext in (".ome",):
+            if stem.endswith(subext):
+                candidate = wsi_path.with_name(stem[:-len(subext)] + ext)
+                if candidate.is_file():
+                    return candidate
+    return None
+
+
+def _build_stem(slide_stem: str, sample_type: str, idx: int, x0: int, y0: int) -> str:
+    return f"{slide_stem}_{sample_type}_{idx:06d}_x{x0}_y{y0}"
+
+
+def _write_dataset_yaml():
+    path = config.OUTPUT_DIR / "dataset.yaml"
+    content = (
+        f"path: {config.OUTPUT_DIR.as_posix()}\n"
+        f"train: images/train\n"
+        f"val: images/val\n"
+        f"names:\n"
+        f"  0: micropapillary\n"
+    )
+    path.write_text(content, encoding="utf-8")
 
 
 if __name__ == "__main__":
