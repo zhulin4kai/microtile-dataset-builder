@@ -21,18 +21,20 @@ def main() -> None:
     pairs = discover_slide_pairs(config.TARGET_DIR)
     print_slide_pairs(pairs)
 
-    split_result = split_slide_pairs(
-        pairs=pairs,
-        split_ratios=config.SPLIT_RATIOS,
-        split_min_slides=config.SPLIT_MIN_SLIDES,
-        ann_weight=config.SPLIT_ANN_WEIGHT,
-        slide_weight=config.SPLIT_SLIDE_WEIGHT,
-        manual_split=config.MANUAL_SPLIT,
-    )
-
-    print_split_result(split_result)
-
-    tasks = _build_tasks(split_result)
+    if config.DATASET_SPLIT_MODE == "wsi":
+        split_result = split_slide_pairs(
+            pairs=pairs,
+            split_ratios=config.SPLIT_RATIOS,
+            split_min_slides=config.SPLIT_MIN_SLIDES,
+            ann_weight=config.SPLIT_ANN_WEIGHT,
+            slide_weight=config.SPLIT_SLIDE_WEIGHT,
+            manual_split=config.MANUAL_SPLIT,
+        )
+        print_split_result(split_result)
+        tasks = _build_tasks(split_result)
+    else:
+        print("[INFO] 使用 patch group-level 划分：所有 WSI 都参与生成，样本写入时再随机分 train/val")
+        tasks = [("patch", pair) for pair in pairs]
 
     print(f"[INFO] 准备开始切图，任务数：{len(tasks)}，workers={config.NUM_WORKERS}")
 
@@ -114,6 +116,8 @@ def _check_config() -> None:
 
     if config.DATASET_TASK not in ("box", "seg"):
         raise ValueError("DATASET_TASK must be 'box' or 'seg'.")
+    if config.DATASET_SPLIT_MODE not in ("wsi", "patch"):
+        raise ValueError("DATASET_SPLIT_MODE must be 'wsi' or 'patch'.")
 
 
 def _build_tasks(split_result: SplitResult) -> List[Tuple[str, SlidePair]]:
@@ -153,6 +157,8 @@ def _print_summary(
         total_neg_requested += neg.requested
         total_neg_saved += neg.saved
 
+        if stats.split_name not in split_summary:
+            split_summary[stats.split_name] = {"pos": 0, "neg": 0}
         split_summary[stats.split_name]["pos"] += pos.saved
         split_summary[stats.split_name]["neg"] += neg.saved
 

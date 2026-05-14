@@ -89,6 +89,7 @@ def write_yolo_sample(
         只保存 orig
     """
     output_dir = Path(output_dir)
+    split_name = _resolve_output_split(split_name, rng)
 
     if split_name not in ("train", "val"):
         raise ValueError(f"Invalid split_name: {split_name}")
@@ -136,6 +137,13 @@ def write_yolo_sample(
         )
 
     return written
+
+
+def _resolve_output_split(split_name: str, rng: random.Random) -> str:
+    if config.DATASET_SPLIT_MODE == "patch":
+        train_ratio = float(config.SPLIT_RATIOS["train"])
+        return "train" if rng.random() < train_ratio else "val"
+    return split_name
 
 
 def save_image(image: Union[Image.Image, np.ndarray], image_path: Path) -> None:
