@@ -1,4 +1,8 @@
+import os
 from pathlib import Path
+
+NUM_WORKERS = max(1, min(12, os.cpu_count() or 4))
+PROCESS_START_METHOD = "spawn"
 
 TARGET_DIR = Path("/home/yuzhoukai/projects/WSIs")
 OUTPUT_DIR = Path("/home/yuzhoukai/projects/ultralytics/dataset")

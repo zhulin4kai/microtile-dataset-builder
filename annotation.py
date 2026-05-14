@@ -80,10 +80,10 @@ def clip_bbox_to_tile(bbox: BBox, x0: int, y0: int, tile_size: int) -> BBox | No
     return (cx1, cy1, cx2, cy2)
 
 
-def bbox_to_yolo(clipped: BBox, tile_size: int) -> Tuple[float, float, float, float]:
+def bbox_to_yolo(clipped: BBox, x0: int, y0: int, tile_size: int) -> Tuple[float, float, float, float]:
     cx1, cy1, cx2, cy2 = clipped
-    xc = ((cx1 + cx2) / 2.0 - 0) / tile_size
-    yc = ((cy1 + cy2) / 2.0 - 0) / tile_size
+    xc = ((cx1 + cx2) / 2.0 - x0) / tile_size
+    yc = ((cy1 + cy2) / 2.0 - y0) / tile_size
     w = (cx2 - cx1) / tile_size
     h = (cy2 - cy1) / tile_size
     return (xc, yc, w, h)
