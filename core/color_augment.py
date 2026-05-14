@@ -40,11 +40,7 @@ def make_color_augmented_images(
     if not config.ENABLE_COLOR_AUGMENT:
         return results
 
-    if config.DATASET_SPLIT_MODE != "patch":
-        if split_name not in config.COLOR_AUGMENT_SPLITS:
-            return results
-
-    if split_name not in ("train", "val"):
+    if split_name != "train":
         return results
 
     results.append(("clahe", apply_clahe(arr, rng)))
