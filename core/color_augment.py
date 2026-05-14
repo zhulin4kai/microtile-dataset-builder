@@ -37,7 +37,14 @@ def make_color_augmented_images(
     arr = np.array(image.convert("RGB"), dtype=np.uint8)
     results: List[Tuple[str, np.ndarray]] = [("orig", arr)]
 
-    if split_name not in config.COLOR_AUGMENT_SPLITS or not config.ENABLE_COLOR_AUGMENT:
+    if not config.ENABLE_COLOR_AUGMENT:
+        return results
+
+    if config.DATASET_SPLIT_MODE != "patch":
+        if split_name not in config.COLOR_AUGMENT_SPLITS:
+            return results
+
+    if split_name not in ("train", "val"):
         return results
 
     results.append(("clahe", apply_clahe(arr, rng)))

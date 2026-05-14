@@ -91,6 +91,7 @@ REQUIRE_CUDA = False
 # "box": YOLO detect bbox 标签 (class xc yc w h)
 # "seg": YOLO segmentation 标签 (class x1 y1 x2 y2 ...)
 DATASET_TASK = "box"
+DATASET_SPLIT_MODE = "patch"  # "wsi" or "patch"
 
 # segmentation 参数（仅 DATASET_TASK == "seg" 时生效）
 SEG_MIN_POLYGON_POINTS = 8
