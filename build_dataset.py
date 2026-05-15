@@ -17,14 +17,76 @@ import numpy as np
 
 import config
 from annotation import (
-    bbox_intersects_tile, bbox_to_yolo,
-    clip_bbox_to_tile, load_annotations,
+    bbox_intersects_tile,
+    bbox_to_yolo,
+    clip_bbox_to_tile,
+    bbox_visible_ratio,
+    load_annotations,
 )
 from augment_writer import save_box_label, save_image_variants
 from slide_io import SlideReader
 
 WSI_EXTENSIONS = {".svs", ".tif", ".tiff", ".ndpi", ".mrxs"}
 GT_EXTENSIONS = {".geojson", ".json"}
+
+MIN_BOX_VISIBLE_RATIO = 0.30
+MIN_TISSUE_RATIO = 0.10
+NEG_RADIUS_STEP = 0.10
+NEG_RADIUS_START = 0.15
+NEG_LOG_INTERVAL = 5000
+
+
+def _has_large_visible_annotation(anns, x0: int, y0: int, tile_size: int) -> bool:
+    for a in anns:
+        if not bbox_intersects_tile(a.bbox, x0, y0, tile_size):
+            continue
+
+        clipped = clip_bbox_to_tile(a.bbox, x0, y0, tile_size)
+        if clipped is None:
+            continue
+
+        visible_ratio = bbox_visible_ratio(a.bbox, clipped)
+        if visible_ratio >= MIN_BOX_VISIBLE_RATIO:
+            return True
+
+    return False
+
+
+def _tissue_ratio(arr: np.ndarray) -> float:
+    import cv2
+
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+
+    tissue_mask = (saturation > 12) & (value < 245)
+    return float(tissue_mask.mean())
+
+
+def _sample_center_outward_origin(
+    rng: random.Random,
+    slide_w: int,
+    slide_h: int,
+    tile_size: int,
+    radius_ratio: float,
+) -> tuple[int, int]:
+    max_x = max(0, slide_w - tile_size)
+    max_y = max(0, slide_h - tile_size)
+
+    cx = slide_w * 0.5
+    cy = slide_h * 0.5
+    radius = min(slide_w, slide_h) * radius_ratio
+
+    px = cx + rng.uniform(-radius, radius)
+    py = cy + rng.uniform(-radius, radius)
+
+    x0 = int(round(px - tile_size * 0.5))
+    y0 = int(round(py - tile_size * 0.5))
+
+    x0 = max(0, min(x0, max_x))
+    y0 = max(0, min(y0, max_y))
+
+    return x0, y0
 
 
 def process_slide_pair(
@@ -72,12 +134,20 @@ def process_slide_pair(
 
             boxes = []
             for a in anns:
-                if bbox_intersects_tile(a.bbox, x0, y0, ts):
-                    clipped = clip_bbox_to_tile(a.bbox, x0, y0, ts)
-                    if clipped is not None:
-                        yb = bbox_to_yolo(clipped, x0, y0, ts)
-                        if yb[2] > 0 and yb[3] > 0:
-                            boxes.append(yb)
+                if not bbox_intersects_tile(a.bbox, x0, y0, ts):
+                    continue
+
+                clipped = clip_bbox_to_tile(a.bbox, x0, y0, ts)
+                if clipped is None:
+                    continue
+
+                visible_ratio = bbox_visible_ratio(a.bbox, clipped)
+                if visible_ratio < MIN_BOX_VISIBLE_RATIO:
+                    continue
+
+                yb = bbox_to_yolo(clipped, x0, y0, ts)
+                if yb[2] > 0 and yb[3] > 0:
+                    boxes.append(yb)
 
             if split_name is not None:
                 split = split_name
@@ -101,24 +171,43 @@ def process_slide_pair(
 
         # ── negative samples ──────────────────────────────────────
         n_neg = raw_pos
-        max_tries = n_neg * 100
+        radius_ratio = NEG_RADIUS_START
         tries = 0
         seen: set[tuple] = set()
 
-        while neg_index < n_neg and tries < max_tries:
+        while neg_index < n_neg:
             tries += 1
-            x0 = rng.randint(0, max(0, w - ts))
-            y0 = rng.randint(0, max(0, h - ts))
+
+            if tries % NEG_LOG_INTERVAL == 0:
+                radius_ratio = min(1.5, radius_ratio + NEG_RADIUS_STEP)
+                print(
+                    f"  [{slide_stem}] neg sampling: "
+                    f"{neg_index}/{n_neg}, tries={tries}, radius_ratio={radius_ratio:.2f}"
+                )
+
+            x0, y0 = _sample_center_outward_origin(
+                rng=rng,
+                slide_w=w,
+                slide_h=h,
+                tile_size=ts,
+                radius_ratio=radius_ratio,
+            )
+
             key = (x0, y0)
             if key in seen:
                 continue
             seen.add(key)
-            if any(bbox_intersects_tile(a.bbox, x0, y0, ts) for a in anns):
+
+            if _has_large_visible_annotation(anns, x0, y0, ts):
+                continue
+
+            img = reader.read_tile(x0, y0, ts)
+            arr = np.array(img, dtype=np.uint8)
+
+            if _tissue_ratio(arr) < MIN_TISSUE_RATIO:
                 continue
 
             neg_index += 1
-            img = reader.read_tile(x0, y0, ts)
-            arr = np.array(img, dtype=np.uint8)
 
             if split_name is not None:
                 split = split_name
@@ -138,10 +227,7 @@ def process_slide_pair(
             else:
                 written_val += len(variant_stems)
 
-        failed_neg = n_neg - neg_index
-        if failed_neg > 0:
-            print(f"  [{slide_stem}] negative: got {neg_index} / {n_neg} after {tries} tries")
-
+        failed_neg = 0
         raw_neg = neg_index
 
     finally:
