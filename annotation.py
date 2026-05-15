@@ -87,3 +87,16 @@ def bbox_to_yolo(clipped: BBox, x0: int, y0: int, tile_size: int) -> Tuple[float
     w = (cx2 - cx1) / tile_size
     h = (cy2 - cy1) / tile_size
     return (xc, yc, w, h)
+
+
+def bbox_visible_ratio(bbox: BBox, clipped: BBox) -> float:
+    x1, y1, x2, y2 = bbox
+    cx1, cy1, cx2, cy2 = clipped
+
+    full_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    clipped_area = max(0.0, cx2 - cx1) * max(0.0, cy2 - cy1)
+
+    if full_area <= 0:
+        return 0.0
+
+    return clipped_area / full_area
