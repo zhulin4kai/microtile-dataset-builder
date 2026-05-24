@@ -5,12 +5,13 @@ OpenSlide-based WSI tile reader.
 
 from __future__ import annotations
 
-import openslide
 from PIL import Image
 
 
 class SlideReader:
     def __init__(self, path: str):
+        import openslide
+
         self._slide = openslide.OpenSlide(path)
         self._w, self._h = self._slide.dimensions
 
