@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-Color augmentation + YOLO label writing.
-"""
+"""颜色增强与 YOLO label 写入。"""
 
 from __future__ import annotations
 
-import os
 import random
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -21,7 +18,7 @@ def make_color_augmented_images(
     image: Image.Image,
     rng: random.Random,
 ) -> List[Tuple[str, np.ndarray]]:
-    """Generate orig + clahe + hsv + brightness_contrast + gamma versions."""
+    """生成 orig 以及可选的颜色增强版本。"""
     arr = np.array(image.convert("RGB"), dtype=np.uint8)
     results: List[Tuple[str, np.ndarray]] = [("orig", arr.copy())]
 
@@ -42,11 +39,11 @@ def save_image_variants(
     split_name: str,
     rng: random.Random,
 ) -> List[str]:
-    """Write image variants to output_dir/images/<split_name>/."""
+    """把 image variants 写入 output_dir/images/<split_name>/。"""
     out_dir = config.OUTPUT_DIR / "images" / split_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # make dummy PIL for augmentation
+    # 增强逻辑以 PIL Image 为入口，这里统一转换一次。
     img = Image.fromarray(arr)
     variants = make_color_augmented_images(img, rng)
     stems: List[str] = []
@@ -61,7 +58,7 @@ def save_image_variants(
 
 
 def save_box_label(label_path: Path, boxes: Sequence[Tuple[float, float, float, float]]) -> None:
-    """Write YOLO detect label: class xc yc w h."""
+    """写入 YOLO detect label：class xc yc w h。"""
     label_path.parent.mkdir(parents=True, exist_ok=True)
     lines: List[str] = []
     for (xc, yc, w, h) in boxes:
@@ -72,6 +69,13 @@ def save_box_label(label_path: Path, boxes: Sequence[Tuple[float, float, float, 
 
 
 # ── internal: color augmentation ──────────────────────────────────────
+
+
+def get_variant_names() -> List[str]:
+    """根据颜色增强开关返回将要写出的 image variant 名称。"""
+    if not config.ENABLE_COLOR_AUGMENT:
+        return ["orig"]
+    return ["orig", "clahe", "hsv", "brightness_contrast", "gamma"]
 
 
 def _apply_clahe(arr: np.ndarray, rng: random.Random) -> np.ndarray:

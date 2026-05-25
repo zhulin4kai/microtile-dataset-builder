@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-GeoJSON annotation loading and bbox utilities.
-"""
+"""GeoJSON annotation 读取与 bbox 工具函数。"""
 
 from __future__ import annotations
 
@@ -22,7 +20,7 @@ class Annotation:
 
 
 def load_annotations(geojson_path: Path) -> List[Annotation]:
-    """Parse a QuPath GeoJSON file into Annotation list."""
+    """读取 QuPath GeoJSON，并转换为可用于切图的 Annotation 列表。"""
     with open(geojson_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -33,9 +31,17 @@ def load_annotations(geojson_path: Path) -> List[Annotation]:
         if not coords or len(coords) < 3:
             continue
 
+        if not all(_is_valid_point(p) for p in coords):
+            continue
+
         xs = [p[0] for p in coords]
         ys = [p[1] for p in coords]
-        bbox = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
+        min_x, min_y = float(min(xs)), float(min(ys))
+        max_x, max_y = float(max(xs)), float(max(ys))
+        bbox = (min_x, min_y, max_x, max_y)
+
+        if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
+            continue
 
         feature_id = feature.get("id") or feature.get("properties", {}).get("id",
                       f"ann_{len(results)}")
@@ -48,18 +54,63 @@ def load_annotations(geojson_path: Path) -> List[Annotation]:
     return results
 
 
+def validate_annotation_file(path: Path) -> dict:
+    """检查 GeoJSON annotation 文件，返回构建前诊断信息。"""
+    result: dict = {
+        "annotation_count": 0,
+        "skipped_features": 0,
+        "error": None,
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        result["error"] = str(e)
+        return result
+
+    features = data.get("features", [])
+    for feature in features:
+        geom = feature.get("geometry", {})
+        coords = _collect_polygon_coords(geom)
+        if not coords or len(coords) < 3:
+            result["skipped_features"] += 1
+            continue
+        if not all(_is_valid_point(p) for p in coords):
+            result["skipped_features"] += 1
+            continue
+        xs = [p[0] for p in coords]
+        ys = [p[1] for p in coords]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
+            result["skipped_features"] += 1
+            continue
+        result["annotation_count"] += 1
+
+    return result
+
+
 def _collect_polygon_coords(geom: dict) -> List[Point] | None:
     gtype = geom.get("type", "")
     raw = geom.get("coordinates", [])
     if gtype == "Polygon" and raw:
-        return raw[0]
+        ring = raw[0]
+        if not ring or len(ring) < 3:
+            return None
+        return ring
     if gtype == "MultiPolygon":
         all_pts: List[Point] = []
         for polygon in raw:
-            if polygon:
+            if polygon and polygon[0] and len(polygon[0]) >= 3:
                 all_pts.extend(polygon[0])
         return all_pts if all_pts else None
     return None
+
+
+def _is_valid_point(point: object) -> bool:
+    if not isinstance(point, (list, tuple)) or len(point) < 2:
+        return False
+    return isinstance(point[0], (int, float)) and isinstance(point[1], (int, float))
 
 
 def bbox_intersects_tile(bbox: BBox, x0: int, y0: int, tile_size: int) -> bool:

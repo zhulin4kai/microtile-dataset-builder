@@ -20,10 +20,6 @@ from typing import List, Tuple
 
 from PIL import Image, ImageDraw
 
-# =========================
-# 配置
-# =========================
-
 DATASET_DIR = Path(r"E:/dataset")
 CHECK_OUTPUT_DIR = Path(r"E:/dataset-analysis-results")
 
@@ -50,17 +46,17 @@ def main() -> None:
     rng = random.Random(RANDOM_SEED)
 
     for split_name in ("train", "val"):
-        print(f"[INFO] checking split: {split_name}")
+        print(f"[INFO] 正在检查 split: {split_name}")
 
         image_dir = DATASET_DIR / "images" / split_name
         label_dir = DATASET_DIR / "labels" / split_name
 
         if not image_dir.exists():
-            print(f"[WARN] image dir not found: {image_dir}")
+            print(f"[WARN] image 目录不存在: {image_dir}")
             continue
 
         if not label_dir.exists():
-            print(f"[WARN] label dir not found: {label_dir}")
+            print(f"[WARN] label 目录不存在: {label_dir}")
             continue
 
         pairs = collect_image_label_pairs(image_dir, label_dir)
@@ -73,9 +69,9 @@ def main() -> None:
         missing_images = label_names - image_names
 
         if missing_labels:
-            print(f"[WARN] {len(missing_labels)} images without label")
+            print(f"[WARN] {len(missing_labels)} 个 image 缺少 label")
         if missing_images:
-            print(f"[WARN] {len(missing_images)} labels without image")
+            print(f"[WARN] {len(missing_images)} 个 label 缺少 image")
 
         pos_pairs = []
         neg_pairs = []
@@ -92,15 +88,20 @@ def main() -> None:
             for cls, xc, yc, w, h in labels:
                 if not (0 <= xc <= 1 and 0 <= yc <= 1 and 0 < w <= 1 and 0 < h <= 1):
                     coord_errors += 1
-                    print(f"[WARN] invalid YOLO coord: {label_path} cls={cls} xc={xc} yc={yc} w={w} h={h}")
+                    print(f"[WARN] YOLO 坐标非法: {label_path} cls={cls} xc={xc} yc={yc} w={w} h={h}")
 
         if coord_errors > 0:
-            print(f"[WARN] {coord_errors} invalid YOLO coordinates")
+            print(f"[WARN] {coord_errors} 个 YOLO 坐标非法")
 
         print(
-            f"  total={len(pairs)}, "
+            f"  images={len(image_names)}, "
+            f"labels={len(label_names)}, "
+            f"missing_label={len(missing_labels)}, "
+            f"missing_image={len(missing_images)}, "
+            f"pairs={len(pairs)}, "
             f"pos={len(pos_pairs)}, "
-            f"neg={len(neg_pairs)}"
+            f"neg={len(neg_pairs)}, "
+            f"coord_errors={coord_errors}"
         )
 
         sampled_pos = sample_pairs(pos_pairs, SAMPLES_PER_SPLIT_POS, rng)
@@ -118,7 +119,7 @@ def main() -> None:
             sample_type="neg",
         )
 
-    print(f"[DONE] check results saved to: {CHECK_OUTPUT_DIR}")
+    print(f"[DONE] 检查结果已保存到: {CHECK_OUTPUT_DIR}")
 
 
 def collect_image_label_pairs(
@@ -137,7 +138,7 @@ def collect_image_label_pairs(
         label_path = label_dir / f"{image_path.stem}.txt"
 
         if not label_path.exists():
-            print(f"[WARN] missing label: {label_path}")
+            print(f"[WARN] 缺少 label: {label_path}")
             continue
 
         pairs.append((image_path, label_path))
@@ -194,7 +195,7 @@ def read_yolo_label(
 
         if len(parts) != 5:
             print(
-                f"[WARN] invalid label line: {label_path}, line={line_no}, text={line}"
+                f"[WARN] label 行格式非法: {label_path}, line={line_no}, text={line}"
             )
             continue
 

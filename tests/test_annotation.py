@@ -10,6 +10,7 @@ from annotation import (
     bbox_visible_ratio,
     clip_bbox_to_tile,
     load_annotations,
+    validate_annotation_file,
 )
 
 
@@ -72,3 +73,169 @@ def test_clip_bbox_and_convert_to_yolo_coordinates():
 def test_clip_bbox_returns_none_for_non_overlap_and_zero_area_ratio():
     assert clip_bbox_to_tile((100.0, 100.0, 120.0, 120.0), 0, 0, 64) is None
     assert bbox_visible_ratio((1.0, 1.0, 1.0, 5.0), (1.0, 1.0, 1.0, 2.0)) == 0.0
+
+
+def test_load_annotations_skips_zero_area_bbox(tmp_path):
+    path = tmp_path / "zero_area.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [0, 0], [0, 0], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    annotations = load_annotations(path)
+    assert len(annotations) == 1
+    assert annotations[0].bbox == (0.0, 0.0, 3.0, 3.0)
+
+
+def test_load_annotations_skips_non_numeric_coords(tmp_path):
+    path = tmp_path / "bad_coords.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[["a", "b"], [0, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    annotations = load_annotations(path)
+    assert len(annotations) == 1
+
+
+def test_load_annotations_skips_malformed_points(tmp_path):
+    path = tmp_path / "malformed_points.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0], [3, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+
+    annotations = load_annotations(path)
+
+    assert len(annotations) == 1
+
+
+def test_load_annotations_skips_polygon_with_few_points(tmp_path):
+    path = tmp_path / "few_points.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [1, 1]]],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    annotations = load_annotations(path)
+    assert len(annotations) == 0
+
+
+def test_validate_annotation_file_valid(tmp_path):
+    path = tmp_path / "valid.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    result = validate_annotation_file(path)
+    assert result["annotation_count"] == 1
+    assert result["skipped_features"] == 0
+    assert result["error"] is None
+
+
+def test_validate_annotation_file_counts_skipped(tmp_path):
+    path = tmp_path / "mixed.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [0, 0], [0, 0], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+                {
+                    "geometry": {"type": "LineString", "coordinates": [[0, 0]]},
+                    "properties": {},
+                },
+                {
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 0]]],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    result = validate_annotation_file(path)
+    assert result["annotation_count"] == 1
+    assert result["skipped_features"] == 2
+
+
+def test_validate_annotation_file_handles_bad_json(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("not json", encoding="utf-8")
+    result = validate_annotation_file(path)
+    assert result["annotation_count"] == 0
+    assert result["error"] is not None

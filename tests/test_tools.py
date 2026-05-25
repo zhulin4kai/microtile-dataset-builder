@@ -75,10 +75,10 @@ def test_check_yolo_dataset_main_reports_integrity_and_writes_samples(monkeypatc
     check_yolo_dataset.main()
 
     output = capsys.readouterr().out
-    assert "images without label" in output
-    assert "labels without image" in output
-    assert "invalid YOLO coordinates" in output
-    assert "image dir not found" in output
+    assert "image 缺少 label" in output
+    assert "label 缺少 image" in output
+    assert "YOLO 坐标非法" in output
+    assert "image 目录不存在" in output
     assert (tmp_path / "checked" / "train" / "pos" / "0001_pos.jpg").is_file()
     assert (tmp_path / "checked" / "train" / "neg" / "0001_neg.jpg").is_file()
 

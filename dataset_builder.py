@@ -1,15 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""
-YOLO detect dataset builder (multi-process).
-
-This module owns dataset discovery, WSI processing orchestration, and
-tile-level positive/negative sample generation. Keep the file count small, but
-make each function do one job so the builder remains easy to change.
-"""
+"""YOLO detect 数据集构建器，多进程处理 WSI 与 GeoJSON annotation。"""
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import random
 import shutil
@@ -27,8 +22,9 @@ from annotation import (
     bbox_to_yolo,
     clip_bbox_to_tile,
     load_annotations,
+    validate_annotation_file,
 )
-from augment_writer import save_box_label, save_image_variants
+from augment_writer import get_variant_names, save_box_label, save_image_variants
 from slide_io import SlideReader
 
 WSI_EXTENSIONS = {".svs", ".tif", ".tiff", ".ndpi", ".mrxs"}
@@ -39,6 +35,32 @@ MIN_TISSUE_RATIO = 0.10
 NEG_RADIUS_STEP = 0.10
 NEG_RADIUS_START = 0.15
 NEG_LOG_INTERVAL = 5000
+
+
+def _validate_config() -> None:
+    if not config.TARGET_DIR.exists():
+        raise FileNotFoundError(f"TARGET_DIR 不存在: {config.TARGET_DIR}")
+    if config.TILE_SIZE <= 0:
+        raise ValueError(f"TILE_SIZE 必须大于 0，当前值: {config.TILE_SIZE}")
+    if config.NUM_WORKERS < 1:
+        raise ValueError(f"NUM_WORKERS 必须大于等于 1，当前值: {config.NUM_WORKERS}")
+    if config.DATASET_TASK != "detect":
+        raise NotImplementedError(
+            "当前构建器只支持 YOLO detect 数据集。"
+        )
+    if config.DATASET_SPLIT_MODE not in {"wsi", "patch"}:
+        raise ValueError(
+            f"DATASET_SPLIT_MODE 必须是 'wsi' 或 'patch'，当前值: {config.DATASET_SPLIT_MODE}"
+        )
+    split_sum = config.SPLIT_RATIOS.get("train", 0) + config.SPLIT_RATIOS.get("val", 0)
+    if abs(split_sum - 1.0) > 0.001:
+        raise ValueError(
+            f"SPLIT_RATIOS 的 train+val 必须约等于 1.0，当前和: {split_sum}"
+        )
+    if config.MAX_NEG_TRIES_PER_POSITIVE < 1:
+        raise ValueError(
+            "MAX_NEG_TRIES_PER_POSITIVE 必须大于等于 1，避免负样本采样无法执行。"
+        )
 
 
 @dataclass(frozen=True)
@@ -55,6 +77,13 @@ class SlideStats:
     written_train: int = 0
     written_val: int = 0
     failed_neg: int = 0
+    status: str = "ok"
+    skip_reason: str = ""
+    error: str = ""
+    neg_reject_duplicate: int = 0
+    neg_reject_annotation: int = 0
+    neg_reject_low_tissue: int = 0
+    neg_reject_try_limit: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -64,6 +93,13 @@ class SlideStats:
             "written_train": self.written_train,
             "written_val": self.written_val,
             "failed_neg": self.failed_neg,
+            "status": self.status,
+            "skip_reason": self.skip_reason,
+            "error": self.error,
+            "neg_reject_duplicate": self.neg_reject_duplicate,
+            "neg_reject_annotation": self.neg_reject_annotation,
+            "neg_reject_low_tissue": self.neg_reject_low_tissue,
+            "neg_reject_try_limit": self.neg_reject_try_limit,
         }
 
 
@@ -74,6 +110,13 @@ class DatasetTotals:
     written_train: int = 0
     written_val: int = 0
     failed_neg: int = 0
+    slides_ok: int = 0
+    slides_skipped: int = 0
+    slides_failed: int = 0
+    neg_reject_duplicate: int = 0
+    neg_reject_annotation: int = 0
+    neg_reject_low_tissue: int = 0
+    neg_reject_try_limit: int = 0
 
     def add(self, result: dict) -> None:
         self.raw_pos += result["raw_pos"]
@@ -81,6 +124,17 @@ class DatasetTotals:
         self.written_train += result["written_train"]
         self.written_val += result["written_val"]
         self.failed_neg += result["failed_neg"]
+        self.neg_reject_duplicate += result.get("neg_reject_duplicate", 0)
+        self.neg_reject_annotation += result.get("neg_reject_annotation", 0)
+        self.neg_reject_low_tissue += result.get("neg_reject_low_tissue", 0)
+        self.neg_reject_try_limit += result.get("neg_reject_try_limit", 0)
+        status = result.get("status", "ok")
+        if status == "ok":
+            self.slides_ok += 1
+        elif status == "skipped":
+            self.slides_skipped += 1
+        else:
+            self.slides_failed += 1
 
 
 @dataclass(frozen=True)
@@ -149,17 +203,21 @@ def process_slide_pair(
     slide_index: int,
     split_name: str | None,
 ) -> dict:
-    """Worker: process one WSI, write images and labels immediately."""
+    """处理单张 WSI，并立即写入图片和 YOLO label。"""
     slide_stem = Path(wsi_path).stem
     stats = SlideStats(slide_stem=slide_stem)
     rng = random.Random(config.RANDOM_SEED + slide_index * 1000003)
+    reader = None
 
-    annotations = load_annotations(Path(gt_path))
-    if not annotations:
-        return stats.as_dict()
-
-    reader = SlideReader(wsi_path)
     try:
+        annotations = load_annotations(Path(gt_path))
+        if not annotations:
+            stats.status = "skipped"
+            stats.skip_reason = "empty_annotations"
+            print(f"[跳过] {slide_stem} 原因=空 annotation")
+            return stats.as_dict()
+
+        reader = SlideReader(wsi_path)
         w, h = reader.dimensions
         stats.raw_pos = _write_positive_samples(
             reader=reader,
@@ -180,17 +238,31 @@ def process_slide_pair(
             rng=rng,
             stats=stats,
         )
-
+        stats.status = "ok"
+    except Exception as e:
+        stats.status = "failed"
+        stats.error = str(e)
     finally:
-        reader.close()
+        if reader is not None:
+            reader.close()
 
+    status_text = _status_text(stats.status)
     print(
-        f"[done] {slide_stem} raw_pos={stats.raw_pos} raw_neg={stats.raw_neg} "
+        f"[{status_text}] {slide_stem} raw_pos={stats.raw_pos} raw_neg={stats.raw_neg} "
         f"train={stats.written_train} val={stats.written_val} "
         f"failed_neg={stats.failed_neg}"
+        + (f" 错误={stats.error}" if stats.error else "")
     )
 
     return stats.as_dict()
+
+
+def _status_text(status: str) -> str:
+    return {
+        "ok": "成功",
+        "skipped": "跳过",
+        "failed": "失败",
+    }.get(status, status)
 
 
 def _write_positive_samples(
@@ -280,19 +352,21 @@ def _write_negative_samples(
     radius_ratio = NEG_RADIUS_START
     tries = 0
     seen: set[tuple[int, int]] = set()
+    max_tries = target_count * config.MAX_NEG_TRIES_PER_POSITIVE
 
-    while neg_index < target_count:
+    # 负样本区域可能很难找到，必须设置上限避免长任务卡死。
+    while neg_index < target_count and tries < max_tries:
         tries += 1
 
         if tries % NEG_LOG_INTERVAL == 0:
             radius_ratio = min(1.5, radius_ratio + NEG_RADIUS_STEP)
             print(
-                f"  [{slide_stem}] neg sampling: "
-                f"{neg_index}/{target_count}, tries={tries}, "
+                f"  [{slide_stem}] 负样本采样: "
+                f"{neg_index}/{target_count}, 尝试={tries}, "
                 f"radius_ratio={radius_ratio:.2f}"
             )
 
-        sample = _try_make_negative_sample(
+        sample, reject_reason = _try_make_negative_sample(
             reader=reader,
             annotations=annotations,
             slide_stem=slide_stem,
@@ -304,10 +378,21 @@ def _write_negative_samples(
             seen=seen,
         )
         if sample is None:
+            if reject_reason == "duplicate":
+                stats.neg_reject_duplicate += 1
+            elif reject_reason == "annotation":
+                stats.neg_reject_annotation += 1
+            elif reject_reason == "low_tissue":
+                stats.neg_reject_low_tissue += 1
             continue
 
         neg_index += 1
         _write_sample(sample, _choose_split(split_name, rng), rng, stats)
+
+    if tries >= max_tries and neg_index < target_count:
+        gap = target_count - neg_index
+        stats.failed_neg += gap
+        stats.neg_reject_try_limit += gap
 
     return neg_index
 
@@ -322,7 +407,7 @@ def _try_make_negative_sample(
     radius_ratio: float,
     rng: random.Random,
     seen: set[tuple[int, int]],
-) -> TileSample | None:
+) -> tuple[TileSample | None, str | None]:
     ts = config.TILE_SIZE
     x0, y0 = _sample_center_outward_origin(
         rng=rng,
@@ -334,21 +419,21 @@ def _try_make_negative_sample(
 
     key = (x0, y0)
     if key in seen:
-        return None
+        return None, "duplicate"
     seen.add(key)
 
     if _has_large_visible_annotation(annotations, x0, y0, ts):
-        return None
+        return None, "annotation"
 
     image = np.array(reader.read_tile(x0, y0, ts), dtype=np.uint8)
     if _tissue_ratio(image) < MIN_TISSUE_RATIO:
-        return None
+        return None, "low_tissue"
 
     return TileSample(
         stem=f"{slide_stem}_neg_{neg_index:06d}_x{x0}_y{y0}",
         image=image,
         boxes=[],
-    )
+    ), None
 
 
 def _choose_split(split_name: str | None, rng: random.Random) -> str:
@@ -365,6 +450,15 @@ def _write_sample(
     rng: random.Random,
     stats: SlideStats,
 ) -> None:
+    # DRY_RUN 只估算写入数量，不落盘 images/labels。
+    if config.DRY_RUN:
+        variant_count = len(get_variant_names())
+        if split_name == "train":
+            stats.written_train += variant_count
+        else:
+            stats.written_val += variant_count
+        return
+
     variant_stems = save_image_variants(sample.image, sample.stem, split_name, rng)
     label_dir = config.OUTPUT_DIR / "labels" / split_name
 
@@ -377,29 +471,101 @@ def _write_sample(
         stats.written_val += len(variant_stems)
 
 
+def _write_build_report(
+    diagnostics: dict,
+    totals: DatasetTotals,
+    slide_results: list[dict],
+) -> None:
+    config_snapshot = {
+        "TARGET_DIR": str(config.TARGET_DIR),
+        "OUTPUT_DIR": str(config.OUTPUT_DIR),
+        "TILE_SIZE": config.TILE_SIZE,
+        "NUM_WORKERS": config.NUM_WORKERS,
+        "SPLIT_RATIOS": config.SPLIT_RATIOS,
+        "DATASET_SPLIT_MODE": config.DATASET_SPLIT_MODE,
+        "DATASET_TASK": config.DATASET_TASK,
+        "ENABLE_COLOR_AUGMENT": config.ENABLE_COLOR_AUGMENT,
+        "DRY_RUN": config.DRY_RUN,
+        "RANDOM_SEED": config.RANDOM_SEED,
+    }
+    report = {
+        "说明": "YOLO detect 数据集构建报告",
+        "config": config_snapshot,
+        "discovery": {
+            "说明": "构建前数据检查结果",
+            **diagnostics,
+        },
+        "slides": [_with_chinese_status(result) for result in slide_results],
+        "totals": {
+            "说明": "构建结果汇总",
+            "raw_pos": totals.raw_pos,
+            "raw_neg": totals.raw_neg,
+            "written_train": totals.written_train,
+            "written_val": totals.written_val,
+            "failed_neg": totals.failed_neg,
+            "slides_ok": totals.slides_ok,
+            "slides_skipped": totals.slides_skipped,
+            "slides_failed": totals.slides_failed,
+            "neg_reject_duplicate": totals.neg_reject_duplicate,
+            "neg_reject_annotation": totals.neg_reject_annotation,
+            "neg_reject_low_tissue": totals.neg_reject_low_tissue,
+            "neg_reject_try_limit": totals.neg_reject_try_limit,
+        },
+        "output_dir": str(config.OUTPUT_DIR),
+    }
+    if config.DRY_RUN:
+        print(f"\n[DRY_RUN] 构建报告预览:\n{json.dumps(report, indent=2, ensure_ascii=False)}")
+    elif config.WRITE_BUILD_REPORT:
+        report_path = config.OUTPUT_DIR / "build_report.json"
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"\n构建报告: {report_path}")
+
+
+def _with_chinese_status(result: dict) -> dict:
+    item = dict(result)
+    item["status_text"] = _status_text(item.get("status", ""))
+    if item.get("skip_reason") == "empty_annotations":
+        item["skip_reason_text"] = "空 annotation"
+    return item
+
+
 def main() -> None:
-    if config.DATASET_TASK != "detect":
-        raise NotImplementedError(
-            "Only detect mode is enabled in this simplified builder.")
-
+    _validate_config()
     _prepare_output_dirs()
-    pairs = _discover_slide_pairs()
+    pairs, diagnostics = _discover_slide_pairs()
 
-    print(f"Found {len(pairs)} slide-annotation pairs")
-    print(f"Using {config.NUM_WORKERS} workers")
-    print(f"Split mode: {config.DATASET_SPLIT_MODE}")
-    print(f"Task: {config.DATASET_TASK}\n")
+    print(f"找到 {len(pairs)} 个 WSI-annotation 配对")
+    print(f"worker 数: {config.NUM_WORKERS}")
+    print(f"split 模式: {config.DATASET_SPLIT_MODE}")
+    print(f"任务类型: {config.DATASET_TASK}")
+    if config.DRY_RUN:
+        print("DRY_RUN 已启用：只做检查和估算，不写 images/labels")
+    if diagnostics["unmatched_wsi"]:
+        print(f"  未配对 WSI 文件数: {diagnostics['unmatched_wsi']}")
+    if diagnostics["orphan_annotations"]:
+        print(f"  孤立 annotation 文件数: {diagnostics['orphan_annotations']}")
+    if diagnostics["invalid_annotations"]:
+        print(f"  解析失败 annotation 文件数: {diagnostics['invalid_annotations']}")
+    if diagnostics["empty_annotations"]:
+        print(f"  空 annotation 文件数: {diagnostics['empty_annotations']}")
+    print()
 
     if not pairs:
-        print("No slide-annotation pairs found. Exiting.")
+        print("没有找到 WSI-annotation 配对，退出。")
         return
 
-    totals = _run_slide_pairs(pairs)
+    if config.DRY_RUN:
+        totals, slide_results = _estimate_dry_run(pairs)
+    else:
+        totals, slide_results = _run_slide_pairs(pairs)
     _write_dataset_yaml()
     _print_summary(totals)
+    _write_build_report(diagnostics, totals, slide_results)
 
 
 def _prepare_output_dirs() -> None:
+    if config.DRY_RUN:
+        return
     if config.OUTPUT_DIR.exists():
         shutil.rmtree(config.OUTPUT_DIR)
     for split in ("train", "val"):
@@ -407,20 +573,97 @@ def _prepare_output_dirs() -> None:
         (config.OUTPUT_DIR / "labels" / split).mkdir(parents=True, exist_ok=True)
 
 
-def _discover_slide_pairs() -> list[SlidePair]:
+def _discover_slide_pairs() -> tuple[list[SlidePair], dict]:
     pairs: list[SlidePair] = []
+    diagnostics: dict = {
+        "total_files_in_target": 0,
+        "wsi_files": 0,
+        "unmatched_wsi": 0,
+        "orphan_annotations": 0,
+        "invalid_annotations": 0,
+        "empty_annotations": 0,
+        "skipped_features": 0,
+    }
+    wsi_paths = []
+    gt_paths_set = set()
 
     for path in sorted(config.TARGET_DIR.iterdir()):
+        diagnostics["total_files_in_target"] += 1
         if path.suffix.lower() in WSI_EXTENSIONS:
-            wsi_path = path
-            gt_path = _find_gt(wsi_path)
-            if gt_path is not None:
-                pairs.append(SlidePair(wsi_path=wsi_path, gt_path=gt_path))
+            wsi_paths.append(path)
+            diagnostics["wsi_files"] += 1
+        elif path.suffix.lower() in GT_EXTENSIONS:
+            gt_paths_set.add(path)
 
-    return pairs
+    for wsi_path in wsi_paths:
+        gt_path = _find_gt(wsi_path)
+        if gt_path is not None:
+            pairs.append(SlidePair(wsi_path=wsi_path, gt_path=gt_path))
+        else:
+            diagnostics["unmatched_wsi"] += 1
+
+    # 构建前顺手检查 annotation 文件质量，避免长任务结束后才发现输入有问题。
+    matched_stems = {p.wsi_path.stem for p in pairs}
+    for ext in (".ome",):
+        matched_stems |= {s[:-len(ext)] for s in matched_stems if s.endswith(ext)}
+    for gt_path in gt_paths_set:
+        stem = gt_path.stem
+        if stem not in matched_stems:
+            diagnostics["orphan_annotations"] += 1
+        info = validate_annotation_file(gt_path)
+        if info["error"]:
+            diagnostics["invalid_annotations"] += 1
+        elif info["annotation_count"] == 0:
+            diagnostics["empty_annotations"] += 1
+        diagnostics["skipped_features"] += info["skipped_features"]
+
+    return pairs, diagnostics
 
 
-def _run_slide_pairs(pairs: list[SlidePair]) -> DatasetTotals:
+def _estimate_dry_run(pairs: list[SlidePair]) -> tuple[DatasetTotals, list[dict]]:
+    totals = DatasetTotals()
+    slide_results: list[dict] = []
+    variant_count = len(get_variant_names())
+    dry_pairs = list(pairs)
+    rng = random.Random(config.RANDOM_SEED)
+
+    if config.DATASET_SPLIT_MODE == "wsi":
+        rng.shuffle(dry_pairs)
+        n_train = int(len(dry_pairs) * config.SPLIT_RATIOS["train"])
+    else:
+        n_train = 0
+
+    for i, pair in enumerate(dry_pairs):
+        info = validate_annotation_file(pair.gt_path)
+        stats = SlideStats(slide_stem=pair.wsi_path.stem)
+        if info["error"]:
+            stats.status = "failed"
+            stats.error = info["error"]
+        elif info["annotation_count"] == 0:
+            stats.status = "skipped"
+            stats.skip_reason = "empty_annotations"
+        else:
+            stats.raw_pos = info["annotation_count"]
+            stats.raw_neg = info["annotation_count"]
+            written_total = (stats.raw_pos + stats.raw_neg) * variant_count
+            if config.DATASET_SPLIT_MODE == "wsi":
+                split_name = _split_for_slide(i, n_train)
+                if split_name == "train":
+                    stats.written_train = written_total
+                else:
+                    stats.written_val = written_total
+            else:
+                stats.written_train = int(round(written_total * config.SPLIT_RATIOS["train"]))
+                stats.written_val = written_total - stats.written_train
+
+        result = stats.as_dict()
+        totals.add(result)
+        slide_results.append(result)
+
+    return totals, slide_results
+
+
+def _run_slide_pairs(pairs: list[SlidePair]) -> tuple[DatasetTotals, list[dict]]:
     rng = random.Random(config.RANDOM_SEED)
     if config.DATASET_SPLIT_MODE == "wsi":
         rng.shuffle(pairs)
@@ -431,6 +674,7 @@ def _run_slide_pairs(pairs: list[SlidePair]) -> DatasetTotals:
     ctx = mp.get_context(config.PROCESS_START_METHOD)
     futures: dict[Future, int] = {}
     totals = DatasetTotals()
+    slide_results: list[dict] = []
 
     with ProcessPoolExecutor(
         max_workers=config.NUM_WORKERS,
@@ -447,9 +691,11 @@ def _run_slide_pairs(pairs: list[SlidePair]) -> DatasetTotals:
             futures[fut] = i
 
         for fut in as_completed(futures):
-            totals.add(fut.result())
+            result = fut.result()
+            totals.add(result)
+            slide_results.append(result)
 
-    return totals
+    return totals, slide_results
 
 
 def _split_for_slide(slide_index: int, n_train: int) -> str | None:
@@ -459,14 +705,27 @@ def _split_for_slide(slide_index: int, n_train: int) -> str | None:
 
 
 def _print_summary(totals: DatasetTotals) -> None:
-    print(f"\nRaw positive: {totals.raw_pos}")
-    print(f"Raw negative: {totals.raw_neg}")
-    print(f"Written train images: {totals.written_train}")
-    print(f"Written val images: {totals.written_val}")
-    print(f"Written total images: {totals.written_train + totals.written_val}")
-    print(f"Output: {config.OUTPUT_DIR}")
+    print(f"\nWSI 处理结果：成功={totals.slides_ok} 跳过={totals.slides_skipped} 失败={totals.slides_failed}")
+    print(f"原始正样本：{totals.raw_pos}")
+    print(f"原始负样本：{totals.raw_neg}")
+    print(f"写入 train images：{totals.written_train}")
+    print(f"写入 val images：{totals.written_val}")
+    print(f"写入 images 总数：{totals.written_train + totals.written_val}")
+    print(f"输出目录：{config.OUTPUT_DIR}")
     if totals.failed_neg > 0:
-        print(f"Failed negatives (not enough empty space): {totals.failed_neg}")
+        print(f"负样本不足：{totals.failed_neg}")
+    if any([
+        totals.neg_reject_duplicate,
+        totals.neg_reject_annotation,
+        totals.neg_reject_low_tissue,
+        totals.neg_reject_try_limit,
+    ]):
+        print(
+            f"负样本拒绝原因: duplicate={totals.neg_reject_duplicate} "
+            f"annotation={totals.neg_reject_annotation} "
+            f"low_tissue={totals.neg_reject_low_tissue} "
+            f"try_limit={totals.neg_reject_try_limit}"
+        )
 
 
 def _find_gt(wsi_path: Path) -> Path | None:
@@ -484,6 +743,8 @@ def _find_gt(wsi_path: Path) -> Path | None:
 
 
 def _write_dataset_yaml():
+    if config.DRY_RUN:
+        return
     path = config.OUTPUT_DIR / "dataset.yaml"
     content = (
         f"path: {config.OUTPUT_DIR.as_posix()}\n"

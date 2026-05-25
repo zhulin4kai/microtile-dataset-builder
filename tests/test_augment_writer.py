@@ -10,6 +10,7 @@ from PIL import Image
 import config
 from augment_writer import (
     _save_jpeg,
+    get_variant_names,
     make_color_augmented_images,
     save_box_label,
     save_image_variants,
@@ -85,3 +86,23 @@ def test_save_jpeg_raises_when_encoder_fails(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="cv2.imencode failed"):
         _save_jpeg(np.zeros((8, 8, 3), dtype=np.uint8), tmp_path / "bad.jpg")
+
+
+def test_get_variant_names_with_augment_enabled():
+    config.ENABLE_COLOR_AUGMENT = True
+    names = get_variant_names()
+    assert names == ["orig", "clahe", "hsv", "brightness_contrast", "gamma"]
+
+
+def test_get_variant_names_with_augment_disabled():
+    config.ENABLE_COLOR_AUGMENT = False
+    names = get_variant_names()
+    assert names == ["orig"]
+
+def test_save_box_label_writes_empty_when_flag_true(tmp_path):
+    label_path = tmp_path / "labels" / "neg.txt"
+
+    save_box_label(label_path, [])
+
+    assert label_path.is_file()
+    assert label_path.read_text(encoding="utf-8") == ""

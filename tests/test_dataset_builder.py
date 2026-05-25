@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 
 import numpy as np
@@ -23,6 +24,10 @@ def restore_config():
         "DATASET_SPLIT_MODE": config.DATASET_SPLIT_MODE,
         "DATASET_TASK": config.DATASET_TASK,
         "NUM_WORKERS": config.NUM_WORKERS,
+        "DRY_RUN": config.DRY_RUN,
+        "MAX_NEG_TRIES_PER_POSITIVE": config.MAX_NEG_TRIES_PER_POSITIVE,
+        "WRITE_BUILD_REPORT": config.WRITE_BUILD_REPORT,
+        "WRITE_EMPTY_LABEL_FOR_NEGATIVE": config.WRITE_EMPTY_LABEL_FOR_NEGATIVE,
     }
     yield
     for name, value in old_values.items():
@@ -45,13 +50,33 @@ def _annotations() -> list[Annotation]:
 
 
 def test_stats_and_totals_convert_worker_results():
-    stats = SlideStats("slide", raw_pos=1, raw_neg=2, written_train=3, written_val=4, failed_neg=5)
+    stats = SlideStats(
+        "slide",
+        raw_pos=1,
+        raw_neg=2,
+        written_train=3,
+        written_val=4,
+        failed_neg=5,
+        status="ok",
+        neg_reject_duplicate=1,
+        neg_reject_annotation=2,
+        neg_reject_low_tissue=3,
+        neg_reject_try_limit=0,
+    )
     totals = DatasetTotals()
 
     totals.add(stats.as_dict())
 
     assert stats.as_dict()["slide_stem"] == "slide"
-    assert totals == DatasetTotals(raw_pos=1, raw_neg=2, written_train=3, written_val=4, failed_neg=5)
+    assert totals.raw_pos == 1
+    assert totals.raw_neg == 2
+    assert totals.written_train == 3
+    assert totals.written_val == 4
+    assert totals.failed_neg == 5
+    assert totals.slides_ok == 1
+    assert totals.neg_reject_duplicate == 1
+    assert totals.neg_reject_annotation == 2
+    assert totals.neg_reject_low_tissue == 3
 
 
 def test_prepare_output_dirs_rebuilds_dataset_tree(tmp_path):
@@ -90,7 +115,7 @@ def test_discover_slide_pairs_ignores_unmatched_and_non_wsi_files(tmp_path):
     (tmp_path / "notes.txt").touch()
     (tmp_path / "orphan.tif").touch()
 
-    pairs = dataset_builder._discover_slide_pairs()
+    pairs, _ = dataset_builder._discover_slide_pairs()
 
     assert pairs == [SlidePair(tmp_path / "case.svs", tmp_path / "case.geojson")]
 
@@ -135,7 +160,7 @@ def test_make_positive_and_negative_samples(monkeypatch):
     rng = random.Random(1)
 
     positive = dataset_builder._make_positive_sample(reader, annotations, annotations[0], "slide", 1)
-    negative = dataset_builder._try_make_negative_sample(
+    negative, neg_reason = dataset_builder._try_make_negative_sample(
         reader=reader,
         annotations=annotations,
         slide_stem="slide",
@@ -146,7 +171,7 @@ def test_make_positive_and_negative_samples(monkeypatch):
         rng=rng,
         seen=set(),
     )
-    duplicate = dataset_builder._try_make_negative_sample(
+    duplicate, dup_reason = dataset_builder._try_make_negative_sample(
         reader=reader,
         annotations=[],
         slide_stem="slide",
@@ -157,12 +182,28 @@ def test_make_positive_and_negative_samples(monkeypatch):
         rng=random.Random(1),
         seen={(187, 260)},
     )
+    # 负样本不能覆盖病灶区域
+    overlap, overlap_reason = dataset_builder._try_make_negative_sample(
+        reader=reader,
+        annotations=_annotations()[:1],
+        slide_stem="slide",
+        slide_w=128,
+        slide_h=128,
+        neg_index=1,
+        radius_ratio=0.0,
+        rng=random.Random(1),
+        seen=set(),
+    )
 
     assert positive.stem == "slide_pos_000001_x8_y8"
     assert positive.boxes
     assert negative is not None
     assert negative.boxes == []
+    assert neg_reason is None
     assert duplicate is None
+    assert dup_reason == "duplicate"
+    assert overlap is None
+    assert overlap_reason == "annotation"
 
 
 def test_negative_sample_rejects_annotation_overlap_and_blank_tissue(monkeypatch):
@@ -175,7 +216,7 @@ def test_negative_sample_rejects_annotation_overlap_and_blank_tissue(monkeypatch
             return Image.new("RGB", (tile_size, tile_size), "white")
 
     config.TILE_SIZE = 64
-    overlapped = dataset_builder._try_make_negative_sample(
+    overlapped, overlap_reason = dataset_builder._try_make_negative_sample(
         reader=FakeSlideReader("slide.svs"),
         annotations=_annotations()[:1],
         slide_stem="slide",
@@ -186,7 +227,7 @@ def test_negative_sample_rejects_annotation_overlap_and_blank_tissue(monkeypatch
         rng=random.Random(1),
         seen=set(),
     )
-    blank = dataset_builder._try_make_negative_sample(
+    blank, blank_reason = dataset_builder._try_make_negative_sample(
         reader=BlankSlideReader("slide.svs"),
         annotations=[],
         slide_stem="slide",
@@ -199,7 +240,9 @@ def test_negative_sample_rejects_annotation_overlap_and_blank_tissue(monkeypatch
     )
 
     assert overlapped is None
+    assert overlap_reason == "annotation"
     assert blank is None
+    assert blank_reason == "low_tissue"
 
 
 def test_write_sample_creates_image_and_label(tmp_path):
@@ -283,14 +326,11 @@ def test_process_slide_pair_returns_zero_stats_for_empty_annotations(tmp_path):
 
     result = dataset_builder.process_slide_pair(str(tmp_path / "case.svs"), str(empty), 0, "train")
 
-    assert result == {
-        "slide_stem": "case",
-        "raw_pos": 0,
-        "raw_neg": 0,
-        "written_train": 0,
-        "written_val": 0,
-        "failed_neg": 0,
-    }
+    assert result["slide_stem"] == "case"
+    assert result["raw_pos"] == 0
+    assert result["raw_neg"] == 0
+    assert result["status"] == "skipped"
+    assert result["skip_reason"] == "empty_annotations"
 
 
 def test_split_for_slide_and_summary_output(capsys, tmp_path):
@@ -299,11 +339,16 @@ def test_split_for_slide_and_summary_output(capsys, tmp_path):
 
     assert dataset_builder._split_for_slide(0, 1) == "train"
     assert dataset_builder._split_for_slide(1, 1) == "val"
-    dataset_builder._print_summary(DatasetTotals(raw_pos=1, raw_neg=1, written_train=2, failed_neg=3))
+    totals = DatasetTotals(
+        raw_pos=1, raw_neg=1, written_train=2, failed_neg=3,
+        slides_ok=1, slides_skipped=0, slides_failed=0,
+    )
+    dataset_builder._print_summary(totals)
 
     captured = capsys.readouterr().out
-    assert "Raw positive: 1" in captured
-    assert "Failed negatives" in captured
+    assert "WSI 处理结果：成功=1 跳过=0 失败=0" in captured
+    assert "原始正样本：1" in captured
+    assert "负样本不足" in captured
 
 
 def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
@@ -336,6 +381,13 @@ def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
                     "written_train": 2 if split_name == "train" else 0,
                     "written_val": 2 if split_name == "val" else 0,
                     "failed_neg": 0,
+                    "status": "ok",
+                    "skip_reason": "",
+                    "error": "",
+                    "neg_reject_duplicate": 0,
+                    "neg_reject_annotation": 0,
+                    "neg_reject_low_tissue": 0,
+                    "neg_reject_try_limit": 0,
                 }
             )
 
@@ -346,17 +398,19 @@ def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
     monkeypatch.setattr(dataset_builder, "ProcessPoolExecutor", FakeExecutor)
     monkeypatch.setattr(dataset_builder, "as_completed", lambda futures: list(futures))
 
-    totals = dataset_builder._run_slide_pairs([pair_a, pair_b])
+    totals, slide_results = dataset_builder._run_slide_pairs([pair_a, pair_b])
 
     assert totals.raw_pos == 2
     assert totals.raw_neg == 2
     assert totals.written_train + totals.written_val == 4
+    assert len(slide_results) == 2
 
 
 def test_main_handles_invalid_task_and_empty_dataset(monkeypatch, tmp_path, capsys):
     config.DATASET_TASK = "seg"
+    config.TARGET_DIR = tmp_path
     with pytest.raises(NotImplementedError):
-        dataset_builder.main()
+        dataset_builder._validate_config()
 
     config.DATASET_TASK = "detect"
     config.TARGET_DIR = tmp_path / "input"
@@ -365,7 +419,7 @@ def test_main_handles_invalid_task_and_empty_dataset(monkeypatch, tmp_path, caps
 
     dataset_builder.main()
 
-    assert "No slide-annotation pairs found" in capsys.readouterr().out
+    assert "没有找到 WSI-annotation 配对" in capsys.readouterr().out
     assert (config.OUTPUT_DIR / "images" / "train").is_dir()
 
 
@@ -373,16 +427,221 @@ def test_build_dataset_entrypoint_exports_builder_main():
     assert build_dataset.main is dataset_builder.main
 
 
-def test_write_dataset_yaml(tmp_path):
+def test_write_dataset_yaml_uses_default_class_name(tmp_path):
     config.OUTPUT_DIR = tmp_path / "out"
     config.OUTPUT_DIR.mkdir()
 
     dataset_builder._write_dataset_yaml()
 
-    assert (config.OUTPUT_DIR / "dataset.yaml").read_text(encoding="utf-8") == (
-        f"path: {config.OUTPUT_DIR.as_posix()}\n"
-        "train: images/train\n"
-        "val: images/val\n"
-        "names:\n"
-        "  0: micropapillary\n"
+    content = (config.OUTPUT_DIR / "dataset.yaml").read_text(encoding="utf-8")
+    assert "  0: micropapillary" in content
+
+
+def test_validate_config_rejects_missing_target_dir(tmp_path):
+    config.TARGET_DIR = tmp_path / "nonexistent"
+    with pytest.raises(FileNotFoundError, match="TARGET_DIR"):
+        dataset_builder._validate_config()
+
+
+def test_validate_config_rejects_bad_tile_size(tmp_path):
+    config.TARGET_DIR = tmp_path
+    config.TILE_SIZE = 0
+    with pytest.raises(ValueError, match="TILE_SIZE"):
+        dataset_builder._validate_config()
+
+
+def test_validate_config_rejects_bad_split_ratios(tmp_path):
+    config.TARGET_DIR = tmp_path
+    config.SPLIT_RATIOS = {"train": 0.5, "val": 0.3}
+    with pytest.raises(ValueError, match="SPLIT_RATIOS"):
+        dataset_builder._validate_config()
+
+
+def test_validate_config_rejects_bad_split_mode(tmp_path):
+    config.TARGET_DIR = tmp_path
+    config.DATASET_SPLIT_MODE = "slide"
+    with pytest.raises(ValueError, match="DATASET_SPLIT_MODE"):
+        dataset_builder._validate_config()
+
+
+def test_validate_config_passes_for_good_config(tmp_path):
+    config.TARGET_DIR = tmp_path
+    config.TILE_SIZE = 512
+    config.NUM_WORKERS = 1
+    config.SPLIT_RATIOS = {"train": 0.75, "val": 0.25}
+    config.DATASET_SPLIT_MODE = "patch"
+    config.DATASET_TASK = "detect"
+    dataset_builder._validate_config()
+
+
+def test_dry_run_does_not_write_files(tmp_path):
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.ENABLE_COLOR_AUGMENT = False
+    config.DRY_RUN = True
+    stats = SlideStats("slide")
+    sample = TileSample(
+        stem="tile",
+        image=np.full((16, 16, 3), (180, 40, 120), dtype=np.uint8),
+        boxes=[(0.5, 0.5, 0.25, 0.25)],
     )
+
+    dataset_builder._write_sample(sample, "train", random.Random(1), stats)
+
+    assert stats.written_train == 1
+    assert not (config.OUTPUT_DIR / "images").exists()
+    assert not (config.OUTPUT_DIR / "labels").exists()
+
+
+def test_dry_run_skips_output_dir_prep(tmp_path):
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.DRY_RUN = True
+    config.OUTPUT_DIR.mkdir()
+
+    dataset_builder._prepare_output_dirs()
+
+    assert not (config.OUTPUT_DIR / "images").exists()
+
+
+def test_main_dry_run_uses_preflight_without_opening_slide(monkeypatch, tmp_path, geojson_path, capsys):
+    config.TARGET_DIR = tmp_path
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.DRY_RUN = True
+    (tmp_path / "case.svs").touch()
+
+    class FailingSlideReader:
+        def __init__(self, path):
+            raise AssertionError("DRY_RUN 不应打开 WSI")
+
+    monkeypatch.setattr(dataset_builder, "SlideReader", FailingSlideReader)
+
+    dataset_builder.main()
+
+    output = capsys.readouterr().out
+    assert "DRY_RUN 已启用" in output
+    assert "原始正样本：2" in output
+    assert not (config.OUTPUT_DIR / "images").exists()
+
+
+def test_negative_sample_try_limit_stops_and_records(monkeypatch, tmp_path):
+    from tests.conftest import FakeSlideReader
+
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.TILE_SIZE = 64
+    config.ENABLE_COLOR_AUGMENT = False
+    config.MAX_NEG_TRIES_PER_POSITIVE = 2
+
+    reader = FakeSlideReader("slide.svs")
+    stats = SlideStats("slide")
+
+    raw_neg = dataset_builder._write_negative_samples(
+        reader=reader,
+        annotations=_annotations(),
+        slide_stem="slide",
+        slide_w=64,
+        slide_h=64,
+        target_count=10,
+        split_name="train",
+        rng=random.Random(1),
+        stats=stats,
+    )
+
+    assert raw_neg < 10
+    assert stats.failed_neg > 0
+    assert stats.neg_reject_try_limit > 0
+
+
+def test_process_slide_pair_handles_exception(monkeypatch, tmp_path, geojson_path):
+    import dataset_builder as db
+
+    class BrokenReader:
+        def __init__(self, path):
+            self.dimensions = (512, 512)
+
+        def clamp_origin(self, x0, y0, ts):
+            return x0, y0
+
+        def read_tile(self, x0, y0, ts):
+            raise RuntimeError("simulated crash")
+
+        def close(self):
+            pass
+
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.TILE_SIZE = 64
+    monkeypatch.setattr(db, "SlideReader", BrokenReader)
+
+    result = db.process_slide_pair(str(tmp_path / "case.svs"), str(geojson_path), 0, "train")
+
+    assert result["status"] == "failed"
+    assert "simulated crash" in result["error"]
+
+
+def test_write_build_report_writes_json(monkeypatch, tmp_path):
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.OUTPUT_DIR.mkdir()
+    config.WRITE_BUILD_REPORT = True
+    config.DRY_RUN = False
+
+    diagnostics = {"total_files_in_target": 5, "wsi_files": 2, "unmatched_wsi": 0, "orphan_annotations": 0}
+    totals = DatasetTotals(raw_pos=2, raw_neg=2, written_train=2, slides_ok=1)
+    slide_results = [{
+        "slide_stem": "case", "raw_pos": 2, "raw_neg": 2,
+        "written_train": 2, "written_val": 0, "failed_neg": 0,
+        "status": "ok", "skip_reason": "", "error": "",
+        "neg_reject_duplicate": 0, "neg_reject_annotation": 0,
+        "neg_reject_low_tissue": 0, "neg_reject_try_limit": 0,
+    }]
+
+    dataset_builder._write_build_report(diagnostics, totals, slide_results)
+
+    report_path = config.OUTPUT_DIR / "build_report.json"
+    assert report_path.is_file()
+    report = json.loads(report_path.read_text())
+    assert report["totals"]["raw_pos"] == 2
+    assert report["slides"][0]["slide_stem"] == "case"
+    assert "config" in report
+    assert report["说明"] == "YOLO detect 数据集构建报告"
+
+
+def test_discover_slide_pairs_diagnostics(tmp_path):
+    config.TARGET_DIR = tmp_path
+
+    (tmp_path / "a.svs").touch()
+    (tmp_path / "a.geojson").touch()
+    (tmp_path / "b.tif").touch()
+    (tmp_path / "orphan.geojson").touch()
+    (tmp_path / "notes.txt").touch()
+
+    pairs, diag = dataset_builder._discover_slide_pairs()
+
+    assert len(pairs) == 1
+    assert pairs[0].wsi_path.name == "a.svs"
+    assert diag["unmatched_wsi"] == 1
+    assert diag["orphan_annotations"] == 1
+
+
+def test_process_slide_pair_logs_failed_status(monkeypatch, tmp_path, geojson_path, capsys):
+    import dataset_builder as db
+
+    class BrokenReader:
+        def __init__(self, path):
+            self.dimensions = (512, 512)
+
+        def clamp_origin(self, x0, y0, ts):
+            return x0, y0
+
+        def read_tile(self, x0, y0, ts):
+            raise RuntimeError("simulated crash")
+
+        def close(self):
+            pass
+
+    config.OUTPUT_DIR = tmp_path / "out"
+    config.TILE_SIZE = 64
+    monkeypatch.setattr(db, "SlideReader", BrokenReader)
+
+    db.process_slide_pair(str(tmp_path / "case.svs"), str(geojson_path), 0, "train")
+
+    captured = capsys.readouterr().out
+    assert "[失败]" in captured
+    assert "simulated crash" in captured
