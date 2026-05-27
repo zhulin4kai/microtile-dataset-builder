@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import multiprocessing as mp
 import random
@@ -11,6 +12,7 @@ import shutil
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
@@ -37,9 +39,17 @@ NEG_RADIUS_START = 0.15
 NEG_LOG_INTERVAL = 5000
 
 
-def _validate_config() -> None:
-    if not config.TARGET_DIR.exists():
-        raise FileNotFoundError(f"TARGET_DIR 不存在: {config.TARGET_DIR}")
+def _validate_config(
+    wsi_path: Path | None = None,
+    geojson_path: Path | None = None,
+) -> None:
+    if wsi_path is None:
+        if not config.TARGET_DIR.exists():
+            raise FileNotFoundError(f"TARGET_DIR 不存在: {config.TARGET_DIR}")
+    elif not wsi_path.exists():
+        raise FileNotFoundError(f"WSI 路径不存在: {wsi_path}")
+    if geojson_path is not None and not geojson_path.exists():
+        raise FileNotFoundError(f"GeoJSON 路径不存在: {geojson_path}")
     if config.TILE_SIZE <= 0:
         raise ValueError(f"TILE_SIZE 必须大于 0，当前值: {config.TILE_SIZE}")
     if config.NUM_WORKERS < 1:
@@ -202,8 +212,12 @@ def process_slide_pair(
     gt_path: str,
     slide_index: int,
     split_name: str | None,
+    runtime_config: dict | None = None,
 ) -> dict:
     """处理单张 WSI，并立即写入图片和 YOLO label。"""
+    if runtime_config is not None:
+        _apply_runtime_config(runtime_config)
+
     slide_stem = Path(wsi_path).stem
     stats = SlideStats(slide_stem=slide_stem)
     rng = random.Random(config.RANDOM_SEED + slide_index * 1000003)
@@ -263,6 +277,38 @@ def _status_text(status: str) -> str:
         "skipped": "跳过",
         "failed": "失败",
     }.get(status, status)
+
+
+def _runtime_config_snapshot() -> dict:
+    return {
+        "OUTPUT_DIR": str(config.OUTPUT_DIR),
+        "TILE_SIZE": config.TILE_SIZE,
+        "SPLIT_RATIOS": dict(config.SPLIT_RATIOS),
+        "ENABLE_COLOR_AUGMENT": config.ENABLE_COLOR_AUGMENT,
+        "RANDOM_SEED": config.RANDOM_SEED,
+        "CLASS_ID": config.CLASS_ID,
+        "IMAGE_EXT": config.IMAGE_EXT,
+        "JPEG_QUALITY": config.JPEG_QUALITY,
+        "WRITE_EMPTY_LABEL_FOR_NEGATIVE": config.WRITE_EMPTY_LABEL_FOR_NEGATIVE,
+        "DRY_RUN": config.DRY_RUN,
+        "MAX_NEG_TRIES_PER_POSITIVE": config.MAX_NEG_TRIES_PER_POSITIVE,
+        "CLAHE_CLIP_LIMIT_RANGE": config.CLAHE_CLIP_LIMIT_RANGE,
+        "CLAHE_TILE_GRID_SIZE": config.CLAHE_TILE_GRID_SIZE,
+        "HSV_HUE_SHIFT_LIMIT": config.HSV_HUE_SHIFT_LIMIT,
+        "HSV_SAT_SHIFT_LIMIT": config.HSV_SAT_SHIFT_LIMIT,
+        "HSV_VAL_SHIFT_LIMIT": config.HSV_VAL_SHIFT_LIMIT,
+        "BRIGHTNESS_LIMIT": config.BRIGHTNESS_LIMIT,
+        "CONTRAST_LIMIT": config.CONTRAST_LIMIT,
+        "GAMMA_LIMIT": config.GAMMA_LIMIT,
+    }
+
+
+def _apply_runtime_config(snapshot: dict) -> None:
+    for name, value in snapshot.items():
+        if name == "OUTPUT_DIR":
+            setattr(config, name, Path(value))
+        else:
+            setattr(config, name, value)
 
 
 def _write_positive_samples(
@@ -529,12 +575,54 @@ def _with_chinese_status(result: dict) -> dict:
     return item
 
 
-def main() -> None:
-    _validate_config()
+def _parse_cli_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="构建 YOLO detect 数据集")
+    parser.add_argument(
+        "--wsi-path",
+        type=Path,
+        default=None,
+        help="输入切片文件或切片目录；未指定时使用 config.TARGET_DIR",
+    )
+    parser.add_argument(
+        "--geojson-path",
+        type=Path,
+        default=None,
+        help="输入 GeoJSON 文件或目录；未指定时默认与切片路径同目录",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="YOLO 数据集输出目录；未指定时使用 config.OUTPUT_DIR",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只检查输入并估算样本数量，不写入 images/labels",
+    )
+    return parser.parse_args([] if argv is None else list(argv))
+
+
+def _apply_cli_args(args: argparse.Namespace) -> None:
+    if args.output_dir is not None:
+        config.OUTPUT_DIR = args.output_dir
+    if args.dry_run:
+        config.DRY_RUN = True
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = _parse_cli_args(argv)
+    _apply_cli_args(args)
+    _validate_config(wsi_path=args.wsi_path, geojson_path=args.geojson_path)
     _prepare_output_dirs()
-    pairs, diagnostics = _discover_slide_pairs()
+    pairs, diagnostics = _discover_slide_pairs(
+        wsi_path=args.wsi_path,
+        geojson_path=args.geojson_path,
+    )
 
     print(f"找到 {len(pairs)} 个 WSI-annotation 配对")
+    print(f"切片路径: {diagnostics['wsi_path']}")
+    print(f"GeoJSON 路径: {diagnostics['geojson_path']}")
     print(f"worker 数: {config.NUM_WORKERS}")
     print(f"split 模式: {config.DATASET_SPLIT_MODE}")
     print(f"任务类型: {config.DATASET_TASK}")
@@ -573,7 +661,12 @@ def _prepare_output_dirs() -> None:
         (config.OUTPUT_DIR / "labels" / split).mkdir(parents=True, exist_ok=True)
 
 
-def _discover_slide_pairs() -> tuple[list[SlidePair], dict]:
+def _discover_slide_pairs(
+    wsi_path: Path | None = None,
+    geojson_path: Path | None = None,
+) -> tuple[list[SlidePair], dict]:
+    wsi_root = wsi_path or config.TARGET_DIR
+    gt_root = geojson_path or (wsi_root.parent if wsi_root.is_file() else wsi_root)
     pairs: list[SlidePair] = []
     diagnostics: dict = {
         "total_files_in_target": 0,
@@ -583,32 +676,37 @@ def _discover_slide_pairs() -> tuple[list[SlidePair], dict]:
         "invalid_annotations": 0,
         "empty_annotations": 0,
         "skipped_features": 0,
+        "wsi_path": str(wsi_root),
+        "geojson_path": str(gt_root),
     }
-    wsi_paths = []
-    gt_paths_set = set()
 
-    for path in sorted(config.TARGET_DIR.iterdir()):
-        diagnostics["total_files_in_target"] += 1
-        if path.suffix.lower() in WSI_EXTENSIONS:
-            wsi_paths.append(path)
-            diagnostics["wsi_files"] += 1
-        elif path.suffix.lower() in GT_EXTENSIONS:
-            gt_paths_set.add(path)
+    wsi_paths, wsi_scan_count = _collect_wsi_paths(wsi_root)
+    gt_paths_set, gt_scan_count = _collect_gt_paths(gt_root)
+    diagnostics["wsi_files"] = len(wsi_paths)
+    diagnostics["total_files_in_target"] = (
+        wsi_scan_count if wsi_root == gt_root else wsi_scan_count + gt_scan_count
+    )
 
-    for wsi_path in wsi_paths:
-        gt_path = _find_gt(wsi_path)
-        if gt_path is not None:
-            pairs.append(SlidePair(wsi_path=wsi_path, gt_path=gt_path))
-        else:
+    matched_gt_paths: set[Path] = set()
+    if wsi_root.is_file() and gt_root.is_file():
+        if wsi_paths and gt_paths_set:
+            gt_path = next(iter(gt_paths_set))
+            pairs.append(SlidePair(wsi_path=wsi_paths[0], gt_path=gt_path))
+            matched_gt_paths.add(gt_path)
+        elif wsi_paths:
             diagnostics["unmatched_wsi"] += 1
+    else:
+        for wsi in wsi_paths:
+            gt_path = _find_gt(wsi, gt_paths_set)
+            if gt_path is not None:
+                pairs.append(SlidePair(wsi_path=wsi, gt_path=gt_path))
+                matched_gt_paths.add(gt_path)
+            else:
+                diagnostics["unmatched_wsi"] += 1
 
     # 构建前顺手检查 annotation 文件质量，避免长任务结束后才发现输入有问题。
-    matched_stems = {p.wsi_path.stem for p in pairs}
-    for ext in (".ome",):
-        matched_stems |= {s[:-len(ext)] for s in matched_stems if s.endswith(ext)}
     for gt_path in gt_paths_set:
-        stem = gt_path.stem
-        if stem not in matched_stems:
+        if gt_path not in matched_gt_paths:
             diagnostics["orphan_annotations"] += 1
         info = validate_annotation_file(gt_path)
         if info["error"]:
@@ -618,6 +716,32 @@ def _discover_slide_pairs() -> tuple[list[SlidePair], dict]:
         diagnostics["skipped_features"] += info["skipped_features"]
 
     return pairs, diagnostics
+
+
+def _collect_wsi_paths(path: Path) -> tuple[list[Path], int]:
+    if path.is_file():
+        return ([path] if path.suffix.lower() in WSI_EXTENSIONS else []), 1
+
+    paths: list[Path] = []
+    scan_count = 0
+    for item in sorted(path.iterdir()):
+        scan_count += 1
+        if item.suffix.lower() in WSI_EXTENSIONS:
+            paths.append(item)
+    return paths, scan_count
+
+
+def _collect_gt_paths(path: Path) -> tuple[set[Path], int]:
+    if path.is_file():
+        return ({path} if path.suffix.lower() in GT_EXTENSIONS else set()), 1
+
+    paths: set[Path] = set()
+    scan_count = 0
+    for item in sorted(path.iterdir()):
+        scan_count += 1
+        if item.suffix.lower() in GT_EXTENSIONS:
+            paths.add(item)
+    return paths, scan_count
 
 
 def _estimate_dry_run(pairs: list[SlidePair]) -> tuple[DatasetTotals, list[dict]]:
@@ -675,6 +799,7 @@ def _run_slide_pairs(pairs: list[SlidePair]) -> tuple[DatasetTotals, list[dict]]
     futures: dict[Future, int] = {}
     totals = DatasetTotals()
     slide_results: list[dict] = []
+    runtime_config = _runtime_config_snapshot()
 
     with ProcessPoolExecutor(
         max_workers=config.NUM_WORKERS,
@@ -687,6 +812,7 @@ def _run_slide_pairs(pairs: list[SlidePair]) -> tuple[DatasetTotals, list[dict]]
                 str(pair.gt_path),
                 i,
                 _split_for_slide(i, n_train),
+                runtime_config,
             )
             futures[fut] = i
 
@@ -728,9 +854,16 @@ def _print_summary(totals: DatasetTotals) -> None:
         )
 
 
-def _find_gt(wsi_path: Path) -> Path | None:
+def _find_gt(wsi_path: Path, gt_paths: set[Path] | None = None) -> Path | None:
+    if gt_paths is not None:
+        match_stems = _gt_match_stems(wsi_path)
+        for gt_path in sorted(gt_paths):
+            if gt_path.stem in match_stems:
+                return gt_path
+        return None
+
     stem = wsi_path.stem
-    for ext in GT_EXTENSIONS:
+    for ext in sorted(GT_EXTENSIONS):
         candidate = wsi_path.with_name(stem + ext)
         if candidate.is_file():
             return candidate
@@ -740,6 +873,15 @@ def _find_gt(wsi_path: Path) -> Path | None:
                 if candidate.is_file():
                     return candidate
     return None
+
+
+def _gt_match_stems(wsi_path: Path) -> set[str]:
+    stem = wsi_path.stem
+    stems = {stem}
+    for subext in (".ome",):
+        if stem.endswith(subext):
+            stems.add(stem[:-len(subext)])
+    return stems
 
 
 def _write_dataset_yaml():
@@ -757,4 +899,6 @@ def _write_dataset_yaml():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    main(sys.argv[1:])

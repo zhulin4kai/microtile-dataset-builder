@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import sys
+
 from dataset_builder import main
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

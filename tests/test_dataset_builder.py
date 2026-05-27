@@ -108,6 +108,51 @@ def test_find_gt_supports_regular_and_ome_names(tmp_path):
     assert dataset_builder._find_gt(tmp_path / "missing.svs") is None
 
 
+def test_discover_slide_pairs_defaults_geojson_to_wsi_path(tmp_path):
+    wsi_dir = tmp_path / "wsi"
+    wsi_dir.mkdir()
+    (wsi_dir / "case.svs").touch()
+    (wsi_dir / "case.geojson").write_text('{"features": []}', encoding="utf-8")
+
+    pairs, diagnostics = dataset_builder._discover_slide_pairs(wsi_path=wsi_dir)
+
+    assert pairs == [SlidePair(wsi_dir / "case.svs", wsi_dir / "case.geojson")]
+    assert diagnostics["wsi_files"] == 1
+
+
+def test_discover_slide_pairs_uses_separate_geojson_path(tmp_path):
+    wsi_dir = tmp_path / "wsi"
+    geojson_dir = tmp_path / "geojson"
+    wsi_dir.mkdir()
+    geojson_dir.mkdir()
+    (wsi_dir / "case.svs").touch()
+    (geojson_dir / "case.geojson").write_text('{"features": []}', encoding="utf-8")
+
+    pairs, diagnostics = dataset_builder._discover_slide_pairs(
+        wsi_path=wsi_dir,
+        geojson_path=geojson_dir,
+    )
+
+    assert pairs == [SlidePair(wsi_dir / "case.svs", geojson_dir / "case.geojson")]
+    assert diagnostics["unmatched_wsi"] == 0
+
+
+def test_discover_slide_pairs_accepts_explicit_file_pair(tmp_path):
+    wsi_path = tmp_path / "slide-a.svs"
+    gt_path = tmp_path / "manual.geojson"
+    wsi_path.touch()
+    gt_path.write_text('{"features": []}', encoding="utf-8")
+
+    pairs, diagnostics = dataset_builder._discover_slide_pairs(
+        wsi_path=wsi_path,
+        geojson_path=gt_path,
+    )
+
+    assert pairs == [SlidePair(wsi_path, gt_path)]
+    assert diagnostics["wsi_files"] == 1
+    assert diagnostics["orphan_annotations"] == 0
+
+
 def test_discover_slide_pairs_ignores_unmatched_and_non_wsi_files(tmp_path):
     config.TARGET_DIR = tmp_path
     (tmp_path / "case.svs").touch()
@@ -352,6 +397,8 @@ def test_split_for_slide_and_summary_output(capsys, tmp_path):
 
 
 def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
+    submitted_configs = []
+
     class FakeFuture:
         def __init__(self, result):
             self._result = result
@@ -371,8 +418,9 @@ def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def submit(self, fn, wsi_path, gt_path, index, split_name):
+        def submit(self, fn, wsi_path, gt_path, index, split_name, runtime_config):
             self.calls.append((fn, wsi_path, gt_path, index, split_name))
+            submitted_configs.append(runtime_config)
             return FakeFuture(
                 {
                     "slide_stem": f"slide{index}",
@@ -395,6 +443,7 @@ def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
     pair_b = SlidePair(tmp_path / "b.svs", tmp_path / "b.geojson")
     config.DATASET_SPLIT_MODE = "wsi"
     config.NUM_WORKERS = 2
+    config.OUTPUT_DIR = tmp_path / "custom-out"
     monkeypatch.setattr(dataset_builder, "ProcessPoolExecutor", FakeExecutor)
     monkeypatch.setattr(dataset_builder, "as_completed", lambda futures: list(futures))
 
@@ -404,6 +453,8 @@ def test_run_slide_pairs_uses_executor_and_accumulates(monkeypatch, tmp_path):
     assert totals.raw_neg == 2
     assert totals.written_train + totals.written_val == 4
     assert len(slide_results) == 2
+    assert submitted_configs
+    assert all(item["OUTPUT_DIR"] == str(config.OUTPUT_DIR) for item in submitted_configs)
 
 
 def test_main_handles_invalid_task_and_empty_dataset(monkeypatch, tmp_path, capsys):
@@ -421,6 +472,51 @@ def test_main_handles_invalid_task_and_empty_dataset(monkeypatch, tmp_path, caps
 
     assert "没有找到 WSI-annotation 配对" in capsys.readouterr().out
     assert (config.OUTPUT_DIR / "images" / "train").is_dir()
+
+
+def test_main_cli_overrides_input_paths_and_dry_run(tmp_path, capsys):
+    wsi_dir = tmp_path / "wsi"
+    geojson_dir = tmp_path / "geojson"
+    output_dir = tmp_path / "out"
+    wsi_dir.mkdir()
+    geojson_dir.mkdir()
+    (wsi_dir / "case.svs").touch()
+    (geojson_dir / "case.geojson").write_text(
+        json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [
+                                [[10, 10], [30, 10], [30, 30], [10, 30], [10, 10]]
+                            ],
+                        },
+                        "properties": {},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.TARGET_DIR = tmp_path / "missing"
+
+    dataset_builder.main([
+        "--wsi-path",
+        str(wsi_dir),
+        "--geojson-path",
+        str(geojson_dir),
+        "--output-dir",
+        str(output_dir),
+        "--dry-run",
+    ])
+
+    output = capsys.readouterr().out
+    assert "找到 1 个 WSI-annotation 配对" in output
+    assert "DRY_RUN 已启用" in output
+    assert config.OUTPUT_DIR == output_dir
 
 
 def test_build_dataset_entrypoint_exports_builder_main():
