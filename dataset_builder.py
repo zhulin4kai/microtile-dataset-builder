@@ -19,6 +19,7 @@ import numpy as np
 import config
 from annotation import (
     Annotation,
+    AnnotationIndex,
     bbox_intersects_tile,
     bbox_visible_ratio,
     bbox_to_yolo,
@@ -154,8 +155,26 @@ class TileSample:
     boxes: list[tuple[float, float, float, float]]
 
 
-def _has_large_visible_annotation(anns, x0: int, y0: int, tile_size: int) -> bool:
-    for a in anns:
+def _annotation_candidates(
+    annotations: list[Annotation],
+    x0: int,
+    y0: int,
+    tile_size: int,
+    annotation_index: AnnotationIndex | None = None,
+) -> list[Annotation]:
+    if annotation_index is None:
+        return annotations
+    return annotation_index.query_tile(x0, y0, tile_size)
+
+
+def _has_large_visible_annotation(
+    anns: list[Annotation],
+    x0: int,
+    y0: int,
+    tile_size: int,
+    annotation_index: AnnotationIndex | None = None,
+) -> bool:
+    for a in _annotation_candidates(anns, x0, y0, tile_size, annotation_index):
         if not bbox_intersects_tile(a.bbox, x0, y0, tile_size):
             continue
 
@@ -230,12 +249,14 @@ def process_slide_pair(
             stats.skip_reason = "empty_annotations"
             print(f"[跳过] {slide_stem} 原因=空 annotation")
             return stats.as_dict()
+        annotation_index = AnnotationIndex(annotations)
 
         reader = SlideReader(wsi_path)
         w, h = reader.dimensions
         stats.raw_pos = _write_positive_samples(
             reader=reader,
             annotations=annotations,
+            annotation_index=annotation_index,
             slide_stem=slide_stem,
             split_name=split_name,
             rng=rng,
@@ -244,6 +265,7 @@ def process_slide_pair(
         stats.raw_neg = _write_negative_samples(
             reader=reader,
             annotations=annotations,
+            annotation_index=annotation_index,
             slide_stem=slide_stem,
             slide_w=w,
             slide_h=h,
@@ -290,6 +312,8 @@ def _runtime_config_snapshot() -> dict:
         "IMAGE_EXT": config.IMAGE_EXT,
         "JPEG_QUALITY": config.JPEG_QUALITY,
         "WRITE_EMPTY_LABEL_FOR_NEGATIVE": config.WRITE_EMPTY_LABEL_FOR_NEGATIVE,
+        "SLIDE_BACKEND": config.SLIDE_BACKEND,
+        "CUCIM_DEVICE": config.CUCIM_DEVICE,
         "DRY_RUN": config.DRY_RUN,
         "MAX_NEG_TRIES_PER_POSITIVE": config.MAX_NEG_TRIES_PER_POSITIVE,
         "CLAHE_CLIP_LIMIT_RANGE": config.CLAHE_CLIP_LIMIT_RANGE,
@@ -314,6 +338,7 @@ def _apply_runtime_config(snapshot: dict) -> None:
 def _write_positive_samples(
     reader: SlideReader,
     annotations: list[Annotation],
+    annotation_index: AnnotationIndex | None,
     slide_stem: str,
     split_name: str | None,
     rng: random.Random,
@@ -326,6 +351,7 @@ def _write_positive_samples(
         sample = _make_positive_sample(
             reader=reader,
             annotations=annotations,
+            annotation_index=annotation_index,
             annotation=ann,
             slide_stem=slide_stem,
             pos_index=pos_index,
@@ -338,6 +364,7 @@ def _write_positive_samples(
 def _make_positive_sample(
     reader: SlideReader,
     annotations: list[Annotation],
+    annotation_index: AnnotationIndex | None,
     annotation: Annotation,
     slide_stem: str,
     pos_index: int,
@@ -353,7 +380,7 @@ def _make_positive_sample(
     return TileSample(
         stem=stem,
         image=image,
-        boxes=_visible_yolo_boxes(annotations, x0, y0, ts),
+        boxes=_visible_yolo_boxes(annotations, x0, y0, ts, annotation_index),
     )
 
 
@@ -362,10 +389,11 @@ def _visible_yolo_boxes(
     x0: int,
     y0: int,
     tile_size: int,
+    annotation_index: AnnotationIndex | None = None,
 ) -> list[tuple[float, float, float, float]]:
     boxes: list[tuple[float, float, float, float]] = []
 
-    for ann in annotations:
+    for ann in _annotation_candidates(annotations, x0, y0, tile_size, annotation_index):
         if not bbox_intersects_tile(ann.bbox, x0, y0, tile_size):
             continue
 
@@ -386,6 +414,7 @@ def _visible_yolo_boxes(
 def _write_negative_samples(
     reader: SlideReader,
     annotations: list[Annotation],
+    annotation_index: AnnotationIndex | None,
     slide_stem: str,
     slide_w: int,
     slide_h: int,
@@ -415,6 +444,7 @@ def _write_negative_samples(
         sample, reject_reason = _try_make_negative_sample(
             reader=reader,
             annotations=annotations,
+            annotation_index=annotation_index,
             slide_stem=slide_stem,
             slide_w=slide_w,
             slide_h=slide_h,
@@ -453,6 +483,7 @@ def _try_make_negative_sample(
     radius_ratio: float,
     rng: random.Random,
     seen: set[tuple[int, int]],
+    annotation_index: AnnotationIndex | None = None,
 ) -> tuple[TileSample | None, str | None]:
     ts = config.TILE_SIZE
     x0, y0 = _sample_center_outward_origin(
@@ -468,7 +499,7 @@ def _try_make_negative_sample(
         return None, "duplicate"
     seen.add(key)
 
-    if _has_large_visible_annotation(annotations, x0, y0, ts):
+    if _has_large_visible_annotation(annotations, x0, y0, ts, annotation_index):
         return None, "annotation"
 
     image = np.array(reader.read_tile(x0, y0, ts), dtype=np.uint8)
@@ -533,6 +564,8 @@ def _write_build_report(
         "ENABLE_COLOR_AUGMENT": config.ENABLE_COLOR_AUGMENT,
         "DRY_RUN": config.DRY_RUN,
         "RANDOM_SEED": config.RANDOM_SEED,
+        "SLIDE_BACKEND": config.SLIDE_BACKEND,
+        "CUCIM_DEVICE": config.CUCIM_DEVICE,
     }
     report = {
         "说明": "YOLO detect 数据集构建报告",

@@ -28,6 +28,8 @@ CLASS_ID = 0
 IMAGE_EXT = ".jpg"
 JPEG_QUALITY = 90
 WRITE_EMPTY_LABEL_FOR_NEGATIVE = True
+SLIDE_BACKEND = "auto"  # "auto" / "openslide" / "cucim"
+CUCIM_DEVICE = "cuda"
 
 DRY_RUN = False
 MAX_NEG_TRIES_PER_POSITIVE = 5000

@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 
+from shapely.geometry import box
+from shapely.strtree import STRtree
+
 Point = Tuple[float, float]
 BBox = Tuple[float, float, float, float]
 
@@ -17,6 +20,31 @@ class Annotation:
     feature_id: str
     polygon: List[Point]
     bbox: BBox
+
+
+class AnnotationIndex:
+    def __init__(self, annotations: List[Annotation]):
+        self._annotations = list(annotations)
+        self._geometries = [box(*ann.bbox) for ann in self._annotations]
+        self._tree = STRtree(self._geometries) if self._geometries else None
+        self._geometry_to_index = {
+            id(geometry): index for index, geometry in enumerate(self._geometries)
+        }
+
+    def query_tile(self, x0: int, y0: int, tile_size: int) -> List[Annotation]:
+        """用 STRtree 空间索引快速筛出和 tile 相交的 annotation 候选。"""
+        if self._tree is None:
+            return []
+
+        tile_box = box(x0, y0, x0 + tile_size, y0 + tile_size)
+        indices: list[int] = []
+        for item in self._tree.query(tile_box):
+            if hasattr(item, "geom_type"):
+                indices.append(self._geometry_to_index[id(item)])
+            else:
+                indices.append(int(item))
+
+        return [self._annotations[index] for index in sorted(indices)]
 
 
 def load_annotations(geojson_path: Path) -> List[Annotation]:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 
 from annotation import (
+    Annotation,
+    AnnotationIndex,
     bbox_intersects_tile,
     bbox_to_yolo,
     bbox_visible_ratio,
@@ -73,6 +76,33 @@ def test_clip_bbox_and_convert_to_yolo_coordinates():
 def test_clip_bbox_returns_none_for_non_overlap_and_zero_area_ratio():
     assert clip_bbox_to_tile((100.0, 100.0, 120.0, 120.0), 0, 0, 64) is None
     assert bbox_visible_ratio((1.0, 1.0, 1.0, 5.0), (1.0, 1.0, 1.0, 2.0)) == 0.0
+
+
+def test_annotation_index_queries_only_intersecting_candidates():
+    annotations = [
+        Annotation("a", [(0, 0), (20, 0), (20, 20), (0, 0)], (0.0, 0.0, 20.0, 20.0)),
+        Annotation(
+            "b",
+            [(100, 100), (130, 100), (130, 130), (100, 100)],
+            (100.0, 100.0, 130.0, 130.0),
+        ),
+    ]
+    index = AnnotationIndex(annotations)
+
+    assert index.query_tile(0, 0, 64) == [annotations[0]]
+    assert index.query_tile(90, 90, 64) == [annotations[1]]
+    assert index.query_tile(40, 40, 32) == []
+
+
+def test_annotation_index_handles_empty_and_geometry_results():
+    empty = AnnotationIndex([])
+    assert empty.query_tile(0, 0, 64) == []
+
+    annotation = Annotation("a", [(0, 0), (20, 0), (20, 20), (0, 0)], (0.0, 0.0, 20.0, 20.0))
+    index = AnnotationIndex([annotation])
+    index._tree = types.SimpleNamespace(query=lambda tile: [index._geometries[0]])
+
+    assert index.query_tile(0, 0, 64) == [annotation]
 
 
 def test_load_annotations_skips_zero_area_bbox(tmp_path):

@@ -28,6 +28,8 @@ def restore_config():
         "MAX_NEG_TRIES_PER_POSITIVE": config.MAX_NEG_TRIES_PER_POSITIVE,
         "WRITE_BUILD_REPORT": config.WRITE_BUILD_REPORT,
         "WRITE_EMPTY_LABEL_FOR_NEGATIVE": config.WRITE_EMPTY_LABEL_FOR_NEGATIVE,
+        "SLIDE_BACKEND": config.SLIDE_BACKEND,
+        "CUCIM_DEVICE": config.CUCIM_DEVICE,
     }
     yield
     for name, value in old_values.items():
@@ -187,6 +189,39 @@ def test_tile_visibility_and_center_sampling():
     assert 0 <= y0 <= 64
 
 
+def test_tile_annotation_queries_can_use_spatial_index():
+    annotations = _annotations()
+
+    class SpyIndex:
+        def __init__(self):
+            self.calls = []
+
+        def query_tile(self, x0, y0, tile_size):
+            self.calls.append((x0, y0, tile_size))
+            return annotations[:1]
+
+    spy = SpyIndex()
+
+    boxes = dataset_builder._visible_yolo_boxes(
+        annotations,
+        180,
+        180,
+        64,
+        annotation_index=spy,
+    )
+    has_annotation = dataset_builder._has_large_visible_annotation(
+        annotations,
+        180,
+        180,
+        64,
+        annotation_index=spy,
+    )
+
+    assert boxes == []
+    assert has_annotation is False
+    assert spy.calls == [(180, 180, 64), (180, 180, 64)]
+
+
 def test_tissue_ratio_detects_colored_tissue_and_blank_background():
     tissue = np.zeros((16, 16, 3), dtype=np.uint8)
     tissue[:, :] = (180, 40, 120)
@@ -204,7 +239,9 @@ def test_make_positive_and_negative_samples(monkeypatch):
     annotations = _annotations()
     rng = random.Random(1)
 
-    positive = dataset_builder._make_positive_sample(reader, annotations, annotations[0], "slide", 1)
+    positive = dataset_builder._make_positive_sample(
+        reader, annotations, None, annotations[0], "slide", 1
+    )
     negative, neg_reason = dataset_builder._try_make_negative_sample(
         reader=reader,
         annotations=annotations,
@@ -321,6 +358,7 @@ def test_write_positive_and_negative_sample_counts(tmp_path):
     raw_pos = dataset_builder._write_positive_samples(
         reader=reader,
         annotations=_annotations()[:1],
+        annotation_index=None,
         slide_stem="slide",
         split_name="train",
         rng=random.Random(1),
@@ -329,6 +367,7 @@ def test_write_positive_and_negative_sample_counts(tmp_path):
     raw_neg = dataset_builder._write_negative_samples(
         reader=reader,
         annotations=[],
+        annotation_index=None,
         slide_stem="slide",
         slide_w=512,
         slide_h=512,
@@ -632,6 +671,7 @@ def test_negative_sample_try_limit_stops_and_records(monkeypatch, tmp_path):
     raw_neg = dataset_builder._write_negative_samples(
         reader=reader,
         annotations=_annotations(),
+        annotation_index=None,
         slide_stem="slide",
         slide_w=64,
         slide_h=64,
