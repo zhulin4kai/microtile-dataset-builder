@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 
-from dataset_builder import main
+from core.cli import main
 
 
 if __name__ == "__main__":

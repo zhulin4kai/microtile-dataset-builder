@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 import config
-from slide_io import SlideReader
+from core.slide_io import SlideReader
 
 
 def test_slide_reader_clamps_reads_and_closes(monkeypatch):

@@ -1,8 +1,9 @@
 """
-YOLO 数据集抽查脚本（高性能版）。
+YOLO 数据集抽查脚本。
 
 运行方式：
     python tools/check_yolo_dataset.py
+    python tools/check_yolo_dataset.py --dataset-dir /path/to/dataset --output-dir /path/to/output
 
 功能：
 1. 从 images/train、images/val 随机抽正样本；
@@ -14,9 +15,10 @@ YOLO 数据集抽查脚本（高性能版）。
 
 from __future__ import annotations
 
+import argparse
 import random
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 from PIL import Image, ImageDraw
 
@@ -34,6 +36,8 @@ CLASS_NAMES = {
     0: "micropapillary",
 }
 
+ALLOW_MISSING_NEGATIVE_LABELS = False
+
 BOX_WIDTH = 3
 
 
@@ -42,7 +46,33 @@ BOX_WIDTH = 3
 # =========================
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    global DATASET_DIR, CHECK_OUTPUT_DIR, SAMPLES_PER_SPLIT_POS, SAMPLES_PER_SPLIT_NEG
+    global ALLOW_MISSING_NEGATIVE_LABELS
+
+    parser = argparse.ArgumentParser(description="YOLO 数据集抽查脚本")
+    parser.add_argument("--dataset-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--samples-per-split-pos", type=int, default=None)
+    parser.add_argument("--samples-per-split-neg", type=int, default=None)
+    parser.add_argument(
+        "--allow-missing-negative-labels",
+        action="store_true",
+        help="允许负样本（stem 含 _neg_）缺 label 时不报警",
+    )
+    args = parser.parse_args([] if argv is None else list(argv))
+
+    if args.dataset_dir is not None:
+        DATASET_DIR = args.dataset_dir
+    if args.output_dir is not None:
+        CHECK_OUTPUT_DIR = args.output_dir
+    if args.samples_per_split_pos is not None:
+        SAMPLES_PER_SPLIT_POS = args.samples_per_split_pos
+    if args.samples_per_split_neg is not None:
+        SAMPLES_PER_SPLIT_NEG = args.samples_per_split_neg
+    if args.allow_missing_negative_labels:
+        ALLOW_MISSING_NEGATIVE_LABELS = True
+
     rng = random.Random(RANDOM_SEED)
 
     for split_name in ("train", "val"):
@@ -61,15 +91,28 @@ def main() -> None:
 
         pairs = collect_image_label_pairs(image_dir, label_dir)
 
-        # 完整性检查
         image_names = {p.stem for p in image_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS}
         label_names = {p.stem for p in label_dir.iterdir() if p.is_file() and p.suffix == ".txt"}
 
         missing_labels = image_names - label_names
         missing_images = label_names - image_names
 
-        if missing_labels:
-            print(f"[WARN] {len(missing_labels)} 个 image 缺少 label")
+        allowed_missing_negative_labels = set()
+        if ALLOW_MISSING_NEGATIVE_LABELS:
+            allowed_missing_negative_labels = {
+                s for s in missing_labels
+                if "_neg_" in s
+            }
+            missing_labels_for_report = {
+                s for s in missing_labels
+                if "_neg_" not in s
+            }
+            if missing_labels_for_report:
+                print(f"[WARN] {len(missing_labels_for_report)} 个 image 缺少 label")
+        else:
+            missing_labels_for_report = missing_labels
+            if missing_labels:
+                print(f"[WARN] {len(missing_labels)} 个 image 缺少 label")
         if missing_images:
             print(f"[WARN] {len(missing_images)} 个 label 缺少 image")
 
@@ -84,7 +127,6 @@ def main() -> None:
             else:
                 neg_pairs.append((image_path, label_path))
 
-            # 坐标合法性检查
             for cls, xc, yc, w, h in labels:
                 if not (0 <= xc <= 1 and 0 <= yc <= 1 and 0 < w <= 1 and 0 < h <= 1):
                     coord_errors += 1
@@ -96,7 +138,8 @@ def main() -> None:
         print(
             f"  images={len(image_names)}, "
             f"labels={len(label_names)}, "
-            f"missing_label={len(missing_labels)}, "
+            f"missing_label={len(missing_labels_for_report)}, "
+            f"allowed_missing_negative_label={len(allowed_missing_negative_labels)}, "
             f"missing_image={len(missing_images)}, "
             f"pairs={len(pairs)}, "
             f"pos={len(pos_pairs)}, "
@@ -138,6 +181,9 @@ def collect_image_label_pairs(
         label_path = label_dir / f"{image_path.stem}.txt"
 
         if not label_path.exists():
+            if ALLOW_MISSING_NEGATIVE_LABELS and "_neg_" in image_path.stem:
+                pairs.append((image_path, label_path))
+                continue
             print(f"[WARN] 缺少 label: {label_path}")
             continue
 
@@ -183,6 +229,11 @@ def save_checked_samples(
 def read_yolo_label(
     label_path: Path,
 ) -> List[Tuple[int, float, float, float, float]]:
+    if not label_path.exists():
+        if ALLOW_MISSING_NEGATIVE_LABELS and "_neg_" in label_path.stem:
+            return []
+        raise FileNotFoundError(label_path)
+
     text = label_path.read_text(encoding="utf-8").strip()
 
     if not text:

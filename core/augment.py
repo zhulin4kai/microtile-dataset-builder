@@ -51,7 +51,7 @@ def save_image_variants(
     for variant, varr in variants:
         vstem = f"{stem}_{variant}"
         path = out_dir / f"{vstem}{config.IMAGE_EXT}"
-        _save_jpeg(varr, path)
+        _save_image(varr, path)
         stems.append(vstem)
 
     return stems
@@ -65,6 +65,11 @@ def save_box_label(label_path: Path, boxes: Sequence[Tuple[float, float, float, 
         if w <= 0 or h <= 0:
             continue
         lines.append(f"{config.CLASS_ID} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
+    if not lines:
+        if not config.WRITE_EMPTY_LABEL_FOR_NEGATIVE:
+            if label_path.exists():
+                label_path.unlink()
+            return
     label_path.write_text("".join(lines), encoding="utf-8")
 
 
@@ -114,13 +119,20 @@ def _apply_gamma(arr: np.ndarray, rng: random.Random) -> np.ndarray:
     return cv2.LUT(arr, lut)
 
 
-# ── internal: JPEG write ──────────────────────────────────────────────
+# ── internal: image write ──────────────────────────────────────────────
 
 
-def _save_jpeg(arr: np.ndarray, path: Path) -> None:
+def _save_image(arr: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-    ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(config.JPEG_QUALITY)])
+    ext = path.suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        params = [int(cv2.IMWRITE_JPEG_QUALITY), int(config.JPEG_QUALITY)]
+        ok, encoded = cv2.imencode(ext, bgr, params)
+    elif ext == ".png":
+        ok, encoded = cv2.imencode(".png", bgr)
+    else:
+        raise ValueError(f"不支持的文件扩展名: {ext}")
     if not ok:
         raise RuntimeError(f"cv2.imencode failed: {path}")
     path.write_bytes(encoded.tobytes())

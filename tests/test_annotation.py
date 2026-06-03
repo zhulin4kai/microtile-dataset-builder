@@ -5,7 +5,7 @@ import types
 
 import pytest
 
-from annotation import (
+from core.annotation import (
     Annotation,
     AnnotationIndex,
     bbox_intersects_tile,
@@ -20,10 +20,13 @@ from annotation import (
 def test_load_annotations_supports_polygon_and_multipolygon(geojson_path):
     annotations = load_annotations(geojson_path)
 
-    assert [ann.feature_id for ann in annotations] == ["poly", "multi"]
+    # Polygon → 1 annotation, MultiPolygon (2 rings) → 2 annotations
+    assert [ann.feature_id for ann in annotations] == ["poly", "multi_1", "multi_2"]
     assert annotations[0].bbox == (10.0, 20.0, 80.0, 90.0)
-    assert annotations[1].bbox == (100.0, 100.0, 170.0, 170.0)
-    assert len(annotations[1].polygon) == 8
+    assert annotations[1].bbox == (100.0, 100.0, 130.0, 120.0)
+    assert annotations[2].bbox == (140.0, 140.0, 170.0, 170.0)
+    assert len(annotations[1].polygon) == 4
+    assert len(annotations[2].polygon) == 4
 
 
 def test_load_annotations_uses_generated_id_for_missing_feature_id(tmp_path):
@@ -269,3 +272,87 @@ def test_validate_annotation_file_handles_bad_json(tmp_path):
     result = validate_annotation_file(path)
     assert result["annotation_count"] == 0
     assert result["error"] is not None
+
+
+def test_multipolygon_parts_do_not_share_large_bbox(tmp_path):
+    path = tmp_path / "far_apart.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [
+                            [[[0, 0], [10, 0], [10, 10], [0, 0]]],
+                            [[[1000, 1000], [1010, 1000], [1010, 1010], [1000, 1000]]],
+                        ],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    annotations = load_annotations(path)
+
+    assert len(annotations) == 2
+    for ann in annotations:
+        x1, y1, x2, y2 = ann.bbox
+        bbox_w = x2 - x1
+        bbox_h = y2 - y1
+        assert bbox_w < 50  # not the giant ~1010-wide bbox
+        assert bbox_h < 50
+
+
+def test_multipolygon_partial_invalid_rings(tmp_path):
+    path = tmp_path / "partial_invalid.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [
+                            [[[0, 0], [1, 1]]],  # too few points
+                            [[[10, 10], [30, 10], [30, 30], [10, 10]]],  # valid
+                        ],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+
+    annotations = load_annotations(path)
+    assert len(annotations) == 1
+    result = validate_annotation_file(path)
+    assert result["annotation_count"] == 1
+    assert result["skipped_features"] == 1
+
+
+def test_validate_annotation_file_multipolygon(tmp_path):
+    path = tmp_path / "mp.geojson"
+    path.write_text(
+        json.dumps({
+            "features": [
+                {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [
+                            [[[0, 0], [3, 0], [3, 3], [0, 0]]],
+                            [[[5, 5], [8, 5], [8, 8], [5, 5]]],
+                        ],
+                    },
+                    "properties": {},
+                },
+            ]
+        }),
+        encoding="utf-8",
+    )
+    result = validate_annotation_file(path)
+    assert result["annotation_count"] == 2
+    assert result["skipped_features"] == 0

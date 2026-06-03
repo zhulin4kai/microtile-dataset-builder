@@ -55,30 +55,34 @@ def load_annotations(geojson_path: Path) -> List[Annotation]:
     results: List[Annotation] = []
     for feature in data.get("features", []):
         geom = feature.get("geometry", {})
-        coords = _collect_polygon_coords(geom)
-        if not coords or len(coords) < 3:
-            continue
+        rings = _iter_polygon_rings(geom)
+        for ring_index, coords in enumerate(rings):
+            if not coords or len(coords) < 3:
+                continue
 
-        if not all(_is_valid_point(p) for p in coords):
-            continue
+            if not all(_is_valid_point(p) for p in coords):
+                continue
 
-        xs = [p[0] for p in coords]
-        ys = [p[1] for p in coords]
-        min_x, min_y = float(min(xs)), float(min(ys))
-        max_x, max_y = float(max(xs)), float(max(ys))
-        bbox = (min_x, min_y, max_x, max_y)
+            xs = [p[0] for p in coords]
+            ys = [p[1] for p in coords]
+            min_x, min_y = float(min(xs)), float(min(ys))
+            max_x, max_y = float(max(xs)), float(max(ys))
+            bbox = (min_x, min_y, max_x, max_y)
 
-        if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
-            continue
+            if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
+                continue
 
-        feature_id = feature.get("id") or feature.get("properties", {}).get("id",
+            base_id = feature.get("id") or feature.get("properties", {}).get("id",
                       f"ann_{len(results)}")
+            feature_id = str(base_id)
+            if len(rings) > 1:
+                feature_id = f"{feature_id}_{ring_index + 1}"
 
-        results.append(Annotation(
-            feature_id=str(feature_id),
-            polygon=coords,
-            bbox=bbox,
-        ))
+            results.append(Annotation(
+                feature_id=feature_id,
+                polygon=coords,
+                bbox=bbox,
+            ))
     return results
 
 
@@ -99,40 +103,46 @@ def validate_annotation_file(path: Path) -> dict:
     features = data.get("features", [])
     for feature in features:
         geom = feature.get("geometry", {})
-        coords = _collect_polygon_coords(geom)
-        if not coords or len(coords) < 3:
+        rings = _iter_polygon_rings(geom)
+        feature_skipped = 0
+        for coords in rings:
+            if not coords or len(coords) < 3:
+                feature_skipped += 1
+                continue
+            if not all(_is_valid_point(p) for p in coords):
+                feature_skipped += 1
+                continue
+            xs = [p[0] for p in coords]
+            ys = [p[1] for p in coords]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+            if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
+                feature_skipped += 1
+                continue
+            result["annotation_count"] += 1
+        if not rings and feature_skipped == 0:
             result["skipped_features"] += 1
-            continue
-        if not all(_is_valid_point(p) for p in coords):
-            result["skipped_features"] += 1
-            continue
-        xs = [p[0] for p in coords]
-        ys = [p[1] for p in coords]
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        if (max_x - min_x) <= 0 or (max_y - min_y) <= 0:
-            result["skipped_features"] += 1
-            continue
-        result["annotation_count"] += 1
+        else:
+            result["skipped_features"] += feature_skipped
 
     return result
 
 
-def _collect_polygon_coords(geom: dict) -> List[Point] | None:
+def _iter_polygon_rings(geom: dict) -> list[list[Point]]:
     gtype = geom.get("type", "")
     raw = geom.get("coordinates", [])
     if gtype == "Polygon" and raw:
         ring = raw[0]
-        if not ring or len(ring) < 3:
-            return None
-        return ring
+        if ring is not None:
+            return [ring]
+        return []
     if gtype == "MultiPolygon":
-        all_pts: List[Point] = []
+        rings: list[list[Point]] = []
         for polygon in raw:
-            if polygon and polygon[0] and len(polygon[0]) >= 3:
-                all_pts.extend(polygon[0])
-        return all_pts if all_pts else None
-    return None
+            if polygon and polygon[0] is not None:
+                rings.append(polygon[0])
+        return rings
+    return []
 
 
 def _is_valid_point(point: object) -> bool:

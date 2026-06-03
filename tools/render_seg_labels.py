@@ -1,5 +1,9 @@
 """
-把 YOLO segmentation label 渲染回 1024x1024 图片。
+YOLO segmentation label 可视化工具。
+
+**注意：当前 dataset builder 只生成 YOLO detect label（bbox）。**
+**本脚本仅用于可视化已有外部 YOLO segmentation label。**
+**不应被用于检查本项目默认构建输出。**
 
 功能：
 1. 读取 labels/*.txt
@@ -9,19 +13,24 @@
 
 YOLO-seg label 格式：
 class x1 y1 x2 y2 x3 y3 ...
+
+运行方式：
+    python tools/render_seg_labels.py
+    python tools/render_seg_labels.py --label-dir /path/to/labels --output-dir /path/to/out
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 
 # =========================
-# 配置
+# 配置（默认值，可被 CLI 覆盖）
 # =========================
 
 IMAGE_DIR = Path(r"/data/dataset_yolo/images/train")
@@ -32,13 +41,10 @@ CANVAS_SIZE = 1024
 
 IMAGE_EXTS = [".jpg", ".jpeg", ".png"]
 
-# 每次最多渲染多少张；None 表示全部
 MAX_FILES = 10
 
-# 是否在原图上叠加；False 则只画白底 mask
 OVERLAY_ON_IMAGE = True
 
-# mask 透明度
 ALPHA = 0.35
 
 
@@ -47,7 +53,43 @@ ALPHA = 0.35
 # =========================
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    global IMAGE_DIR, LABEL_DIR, RENDER_OUTPUT_DIR, CANVAS_SIZE, MAX_FILES, OVERLAY_ON_IMAGE
+
+    parser = argparse.ArgumentParser(
+        description="YOLO segmentation label 可视化工具"
+    )
+    parser.add_argument("--image-dir", type=Path, default=None)
+    parser.add_argument("--label-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--canvas-size", type=int, default=None)
+    parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--overlay-on-image",
+        dest="overlay_on_image",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-overlay",
+        dest="overlay_on_image",
+        action="store_false",
+    )
+    args = parser.parse_args([] if argv is None else list(argv))
+
+    if args.image_dir is not None:
+        IMAGE_DIR = args.image_dir
+    if args.label_dir is not None:
+        LABEL_DIR = args.label_dir
+    if args.output_dir is not None:
+        RENDER_OUTPUT_DIR = args.output_dir
+    if args.canvas_size is not None:
+        CANVAS_SIZE = args.canvas_size
+    if args.max_files is not None:
+        MAX_FILES = args.max_files
+    if args.overlay_on_image is not None:
+        OVERLAY_ON_IMAGE = args.overlay_on_image
+
     RENDER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     label_paths = sorted(LABEL_DIR.glob("*.txt"))
@@ -110,7 +152,6 @@ def read_yolo_seg_label(label_path: Path) -> List[Tuple[int, np.ndarray]]:
         parts = line.strip().split()
 
         if len(parts) < 7:
-            # class + 至少 3 个点
             raise ValueError(f"line {line_no}: too few columns: {len(parts)}")
 
         class_id = int(float(parts[0]))
@@ -182,14 +223,12 @@ def render_segments(
 
         pts_cv = pts.reshape(-1, 1, 2)
 
-        # 半透明填充
         cv2.fillPoly(
             overlay,
             [pts_cv],
             color=(255, 255, 0),
         )
 
-        # 轮廓
         cv2.polylines(
             outline,
             [pts_cv],
@@ -199,7 +238,6 @@ def render_segments(
             lineType=cv2.LINE_AA,
         )
 
-        # 类别 id 标一下，方便确认
         x_text = int(pts[0, 0])
         y_text = int(pts[0, 1])
         cv2.putText(

@@ -150,3 +150,76 @@ def test_render_seg_main_writes_outputs_and_counts_bad_files(monkeypatch, tmp_pa
     assert "bad files: 1" in output
     assert (output_dir / "valid_render.jpg").is_file()
     assert (output_dir / "empty_render.jpg").is_file()
+
+
+def test_render_seg_main_accepts_cli_paths(tmp_path, capsys):
+    label_dir = tmp_path / "labels"
+    image_dir = tmp_path / "images"
+    output_dir = tmp_path / "renders"
+    label_dir.mkdir()
+    image_dir.mkdir()
+    Image.new("RGB", (16, 16), "white").save(image_dir / "tile.jpg")
+    (label_dir / "tile.txt").write_text("0 0.1 0.1 0.8 0.1 0.1 0.8\n", encoding="utf-8")
+
+    render_seg_labels.main([
+        "--label-dir", str(label_dir),
+        "--image-dir", str(image_dir),
+        "--output-dir", str(output_dir),
+        "--canvas-size", "32",
+        "--max-files", "10",
+    ])
+
+    output = capsys.readouterr().out
+    assert "labels: 1" in output
+    assert (output_dir / "tile_render.jpg").is_file()
+
+
+def test_check_yolo_dataset_main_accepts_cli_paths(tmp_path, capsys):
+    dataset_dir = tmp_path / "dataset"
+    train_images = dataset_dir / "images" / "train"
+    train_labels = dataset_dir / "labels" / "train"
+    train_images.mkdir(parents=True)
+    train_labels.mkdir(parents=True)
+    Image.new("RGB", (32, 32), "white").save(train_images / "pos.jpg")
+    (train_labels / "pos.txt").write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
+
+    check_yolo_dataset.main([
+        "--dataset-dir", str(dataset_dir),
+        "--output-dir", str(tmp_path / "checked"),
+        "--samples-per-split-pos", "5",
+        "--samples-per-split-neg", "5",
+    ])
+
+    output = capsys.readouterr().out
+    assert "检查结果已保存" in output
+    assert (tmp_path / "checked" / "train" / "pos" / "0001_pos.jpg").is_file()
+
+
+def test_check_yolo_dataset_allows_missing_negative_labels(tmp_path, capsys):
+    dataset_dir = tmp_path / "dataset"
+    train_images = dataset_dir / "images" / "train"
+    train_labels = dataset_dir / "labels" / "train"
+    val_images = dataset_dir / "images" / "val"
+    val_labels = dataset_dir / "labels" / "val"
+    train_images.mkdir(parents=True)
+    train_labels.mkdir(parents=True)
+    val_images.mkdir(parents=True)
+    val_labels.mkdir(parents=True)
+    Image.new("RGB", (32, 32), "white").save(train_images / "case_neg_000001_orig.jpg")
+    (train_labels / "case_pos.txt").write_text("0 0.5 0.5 0.25 0.25\n", encoding="utf-8")
+    Image.new("RGB", (32, 32), "white").save(train_images / "case_pos.jpg")
+
+    check_yolo_dataset.main([
+        "--dataset-dir", str(dataset_dir),
+        "--output-dir", str(tmp_path / "checked"),
+        "--samples-per-split-pos", "5",
+        "--samples-per-split-neg", "5",
+        "--allow-missing-negative-labels",
+    ])
+
+    output = capsys.readouterr().out
+    assert "image 缺少 label" not in output
+    assert "missing_label=0" in output
+    assert "allowed_missing_negative_label=1" in output
+    assert "neg=1" in output
+    assert (tmp_path / "checked" / "train" / "neg" / "0001_case_neg_000001_orig.jpg").is_file()

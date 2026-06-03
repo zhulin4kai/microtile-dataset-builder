@@ -30,7 +30,13 @@ class CuCIMBackend:
     name = "cucim"
 
     def __init__(self, path: str):
-        from cucim import CuImage
+        try:
+            cucim = __import__("cucim", fromlist=["CuImage"])
+            CuImage = cucim.CuImage
+        except ImportError as exc:
+            raise ImportError(
+                "cuCIM backend requires the cucim package, which is not installed."
+            ) from exc
 
         self._slide = CuImage(path)
         level_dimensions = self._slide.resolutions["level_dimensions"]
