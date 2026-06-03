@@ -1,17 +1,17 @@
 # WSI Dataset Builder
 
-WSI Dataset Builder is a dataset construction tool for generating vision model training datasets from whole-slide images (WSI) and GeoJSON annotations.
+WSI Dataset Builder 用于从全切片图像（Whole Slide Image, WSI）和 GeoJSON 标注中切割图像块，并构建可用于视觉模型训练的数据集。
 
-The project separates WSI-specific processing from dataset-format-specific output. The core pipeline handles slide discovery, annotation parsing, tile sampling, split assignment, multiprocessing, and reporting. Output formats are implemented as adapters under `formats/`.
+项目将 WSI 处理流程与数据集输出格式分离。`core/` 负责 WSI 发现、标注解析、tile 采样、数据划分、多进程处理和构建报告；`formats/` 负责具体数据集格式的输出适配。
 
-## Inputs and Outputs
+## 输入与输出
 
-Supported input files:
+支持的输入文件：
 
-- WSI: `.svs`, `.tif`, `.tiff`, `.ndpi`, `.mrxs`
-- Annotation: `.geojson`, `.json`
+- WSI 文件：`.svs`、`.tif`、`.tiff`、`.ndpi`、`.mrxs`
+- 标注文件：`.geojson`、`.json`
 
-Default output layout:
+默认输出结构：
 
 ```text
 OUTPUT_DIR/
@@ -25,9 +25,9 @@ OUTPUT_DIR/
 └── build_report.json
 ```
 
-`build_report.json` records input discovery diagnostics, per-slide processing status, output counts, and negative-sampling rejection statistics.
+`build_report.json` 记录输入发现结果、每张 WSI 的处理状态、输出样本数量和负样本采样拒绝统计。
 
-## Repository Layout
+## 目录结构
 
 ```text
 .
@@ -50,22 +50,22 @@ OUTPUT_DIR/
 └── tests/
 ```
 
-Module responsibilities:
+模块职责：
 
-- `core.annotation`: GeoJSON parsing, annotation validation, bbox utilities.
-- `core.slide_io`: WSI reading backends.
-- `core.discovery`: WSI and annotation file discovery and pairing.
-- `core.sampling`: positive/negative tile sampling and split assignment.
-- `core.augment`: image augmentation and image encoding.
-- `core.pipeline`: build orchestration and multiprocessing.
-- `core.reporting`: summary and build report generation.
-- `core.runtime_config`: runtime configuration snapshot for spawned workers.
-- `formats`: dataset output format adapters.
-- `tools`: standalone dataset inspection and annotation utility scripts.
+- `core.annotation`：GeoJSON 解析、标注校验和 bbox 工具函数。
+- `core.slide_io`：WSI 读取后端。
+- `core.discovery`：WSI 与标注文件发现、配对和诊断。
+- `core.sampling`：正负样本采样和 train / val 划分。
+- `core.augment`：图像增强和图像编码。
+- `core.pipeline`：构建流程编排和多进程调度。
+- `core.reporting`：汇总输出和构建报告。
+- `core.runtime_config`：多进程 worker 配置同步。
+- `formats`：数据集输出格式适配层。
+- `tools`：数据检查和标注统计脚本。
 
-## Installation
+## 安装
 
-Create a virtual environment and install Python dependencies:
+创建虚拟环境并安装依赖：
 
 ```bash
 python -m venv .venv
@@ -73,20 +73,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-The OpenSlide backend requires the OpenSlide system library in addition to the Python package. The cuCIM backend is optional and is selected through configuration.
+如果使用 OpenSlide 后端，需要额外安装 OpenSlide 系统库。cuCIM 后端为可选项，通过配置启用。
 
-## Configuration
+## 配置
 
-Runtime configuration is defined in `config.py`.
+运行配置位于 `config.py`。
 
-Required path settings:
+路径配置：
 
 ```python
 TARGET_DIR = Path("/path/to/wsi-directory")
 OUTPUT_DIR = Path("/path/to/output-directory")
 ```
 
-Common build settings:
+构建配置：
 
 ```python
 TILE_SIZE = 1024
@@ -97,7 +97,7 @@ SPLIT_RATIOS = {
     "train": 0.75,
     "val": 0.25,
 }
-DATASET_SPLIT_MODE = "patch"  # "patch" or "wsi"
+DATASET_SPLIT_MODE = "patch"  # "patch" 或 "wsi"
 
 ENABLE_COLOR_AUGMENT = True
 RANDOM_SEED = 42
@@ -105,22 +105,22 @@ DISCOVER_RECURSIVE = True
 DRY_RUN = False
 ```
 
-Slide backend settings:
+WSI 后端配置：
 
 ```python
-SLIDE_BACKEND = "auto"  # "auto", "openslide", or "cucim"
+SLIDE_BACKEND = "auto"  # "auto"、"openslide" 或 "cucim"
 CUCIM_DEVICE = "cuda"
 ```
 
-## Usage
+## 运行
 
-Run with values from `config.py`:
+使用 `config.py` 中的路径配置运行：
 
 ```bash
 python main.py
 ```
 
-Override input and output paths:
+通过命令行临时指定输入和输出路径：
 
 ```bash
 python main.py \
@@ -129,7 +129,7 @@ python main.py \
   --output-dir /path/to/output-directory
 ```
 
-Run input discovery and count estimation without writing images or labels:
+只执行输入发现和样本数量估算，不写入图像和标签：
 
 ```bash
 python main.py \
@@ -138,46 +138,46 @@ python main.py \
   --dry-run
 ```
 
-## Annotation Handling
+## 标注处理
 
-The annotation parser reads GeoJSON `Polygon` and `MultiPolygon` geometries.
+标注解析器读取 GeoJSON 中的 `Polygon` 和 `MultiPolygon`。
 
-Parsing rules:
+解析规则：
 
-- A `Polygon` produces one annotation.
-- Each polygon inside a `MultiPolygon` is converted into an independent annotation.
-- Invalid geometries are skipped and counted in diagnostics.
-- Annotation bbox values are computed from polygon exterior coordinates.
-- GeoJSON feature IDs are preserved when present; generated IDs are used otherwise.
+- 一个 `Polygon` 生成一个 annotation。
+- `MultiPolygon` 中的每个 polygon 会拆分为独立 annotation。
+- 无效几何会被跳过，并计入诊断信息。
+- annotation 的 bbox 由 polygon 外环坐标计算得到。
+- GeoJSON feature ID 会在存在时保留；缺失时使用自动生成的 ID。
 
-WSI and annotation pairing is based on filename stem. For example:
+WSI 和标注文件按文件名 stem 配对：
 
 ```text
 case_001.svs      -> case_001.geojson
 case_002.ome.tif  -> case_002.geojson
 ```
 
-When recursive discovery finds multiple annotation candidates with the same stem, the ambiguity is recorded in diagnostics.
+递归发现时，如果多个标注文件与同一 WSI stem 匹配，歧义数量会写入诊断信息。
 
-## Sampling
+## 样本采样
 
-Positive samples are generated around annotation centers. Negative samples are sampled from the slide and rejected when they:
+正样本围绕 annotation 中心生成。负样本从 WSI 中采样，并在以下情况下被拒绝：
 
-- duplicate a previously selected negative tile origin,
-- contain a sufficiently visible annotation,
-- fail the minimum tissue-ratio threshold,
-- exceed the configured retry limit.
+- tile origin 与已选负样本重复；
+- tile 中包含达到可见比例阈值的 annotation；
+- tile 的组织区域比例低于阈值；
+- 超过最大采样尝试次数。
 
-Split assignment is controlled by `DATASET_SPLIT_MODE`:
+数据划分由 `DATASET_SPLIT_MODE` 控制：
 
-- `patch`: each generated tile is assigned independently.
-- `wsi`: all tiles from the same WSI are assigned to the same split.
+- `patch`：每个 tile 独立划分到 train 或 val。
+- `wsi`：同一张 WSI 生成的全部 tile 进入同一个 split。
 
-## Output Format Adapters
+## 输出格式适配层
 
-Dataset output logic is isolated under `formats/`.
+数据集输出逻辑集中在 `formats/`。
 
-The adapter interface is defined in `formats/base.py`:
+适配器接口定义在 `formats/base.py`：
 
 ```python
 class DatasetFormat(Protocol):
@@ -190,19 +190,19 @@ class DatasetFormat(Protocol):
     def variant_count(self) -> int: ...
 ```
 
-To add a new output format:
+新增输出格式时，应按以下步骤处理：
 
-1. Add a new adapter module under `formats/`.
-2. Implement `DatasetFormat`.
-3. Define the output directory structure and metadata writer.
-4. Convert `TileSample` objects into the target label representation.
-5. Register the adapter in the format selector.
+1. 在 `formats/` 下新增适配器模块。
+2. 实现 `DatasetFormat` 接口。
+3. 定义输出目录结构和元信息写入方式。
+4. 将 `TileSample` 转换为目标格式所需的标签表示。
+5. 在格式选择逻辑中注册该适配器。
 
-The core pipeline should not contain format-specific label-writing logic.
+`core/` 中不应包含具体输出格式的标签写入逻辑。
 
-## Tools
+## 工具脚本
 
-Inspect generated datasets:
+检查构建后的数据集：
 
 ```bash
 python tools/check_yolo_dataset.py \
@@ -210,13 +210,13 @@ python tools/check_yolo_dataset.py \
   --output-dir /path/to/check-output
 ```
 
-Count GeoJSON annotations:
+统计 GeoJSON 标注数量：
 
 ```bash
 python tools/count_geojson_annotations.py /path/to/input -r
 ```
 
-Render existing segmentation labels:
+渲染已有 segmentation label：
 
 ```bash
 python tools/render_seg_labels.py \
@@ -225,9 +225,9 @@ python tools/render_seg_labels.py \
   --output-dir /path/to/render-output
 ```
 
-## Testing
+## 测试
 
-Run the test suite:
+运行测试：
 
 ```bash
 .venv/bin/python -m pytest -q
